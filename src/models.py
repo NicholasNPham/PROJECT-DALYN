@@ -68,6 +68,8 @@ class Config:
         log_path: Absolute path to the directory where log files are written.
         polling_interval_minutes: How often the pipeline checks for new emails, in whole minutes.
         stac_url: Base URL of the STAC web application used by the Selenium automation.
+        outlook_retry_attempts: Number of times to retry an Outlook email.
+        outlook_retry_delay_seconds: Number of seconds to retry an Outlook email.
     """
     accounts: list[str]
     outlook_profile: str
@@ -77,3 +79,5 @@ class Config:
     log_path: str
     polling_interval_minutes: int
     stac_url: str
+    outlook_retry_attempts: int
+    outlook_retry_delay_seconds: int
