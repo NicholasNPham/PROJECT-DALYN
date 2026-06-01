@@ -5,7 +5,7 @@ import time
 import win32com.client
 
 # LOCAL IMPORTS
-from models import Config
+from models import Config, Email
 
 class EmailMonitor:
     def __init__(self, config: Config) -> None:
@@ -34,3 +34,40 @@ class EmailMonitor:
         else:
             print(f"Failed to connect to Outlook after {self.config.outlook_retry_attempts} attempts.")
             raise ConnectionError(f"Failed to connect to Outlook after {self.config.outlook_retry_attempts} attempts.")
+
+    def get_unread_emails(self) -> list[Email]:
+        """
+        Retrieves all unread emails from each monitored Outlook inbox.
+
+        Iterates over all configured accounts, locates the matching Outlook store,
+        and collects unread messages using the Restrict filter. Each message is
+        mapped to an Email dataclass. UCN is set to None and resolved downstream.
+        Attachments are not processed here and default to an empty list.
+
+        Returns:
+            A list of Email objects representing all unread messages across all
+            monitored accounts. Returns an empty list if no unread messages are found.
+        """
+        emails = []
+
+        for account in self.config.accounts: # for each account in a list of accounts
+            for store in self.namespace.Stores: # for each store in stores; stores = outlook object model
+                if store.DisplayName == account: # If the store name matches the account name
+                    inbox = store.GetDefaultFolder(6) # assigning inbox with the return of getDefaultFolder(6) inbox
+                    messages = inbox.Items # assigning messages with everything inside that inbox
+                    unread_messages = messages.Restrict("[Unread] = True") # assigning unread_messages with anything that is unread in the inbox folder
+                    for unread_message in unread_messages: # for each unread_messages in the collection of unread_messages
+                        unread_email = Email( # assign unread_emails with a Email Class Object that parses the data into its parameters
+                            message_id=unread_message.EntryID,
+                            account=account,
+                            sender=unread_message.SenderEmailAddress,
+                            body=unread_message.Body,
+                            subject=unread_message.Subject,
+                            ucn=None,
+                            attachments=[])
+
+                        emails.append(unread_email) # appends the email class object to the results list
+
+                    break # break to the next account not store
+
+        return emails
