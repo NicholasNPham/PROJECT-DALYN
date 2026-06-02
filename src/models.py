@@ -64,17 +64,19 @@ class Config:
         outlook_profile: Name of the Windows Outlook profile used by win32com to open Outlook.
         folder_completed: Name of the Outlook folder to move successfully processed emails into.
         folder_manual_review: Name of the Outlook folder to move emails that failed classification into.
+        temp_folder:  Absolute path to the temporary directory where PDF attachments are saved during processing.
         excel_path: Absolute path to the Excel phrase scoring sheet used by the classifier.
         log_path: Absolute path to the directory where log files are written.
         polling_interval_minutes: How often the pipeline checks for new emails, in whole minutes.
         stac_url: Base URL of the STAC web application used by the Selenium automation.
-        outlook_retry_attempts: Number of times to retry an Outlook email.
-        outlook_retry_delay_seconds: Number of seconds to retry an Outlook email.
+        outlook_retry_attempts: Number of times to retry connecting to Outlook before giving up
+        outlook_retry_delay_seconds: Number of seconds to wait between each Outlook connection retry
     """
     accounts: list[str]
     outlook_profile: str
     folder_completed: str
     folder_manual_review: str
+    temp_folder: str
     excel_path: str
     log_path: str
     polling_interval_minutes: int
