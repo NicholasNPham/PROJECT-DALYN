@@ -5,7 +5,7 @@ import time
 import win32com.client
 
 # LOCAL IMPORTS
-from models import Config, Email
+from models import Config, Email, PDF
 
 class EmailMonitor:
     def __init__(self, config: Config) -> None:
@@ -71,3 +71,6 @@ class EmailMonitor:
                     break # break to the next account not store
 
         return emails
+
+    def save_attachments(self, email: Email) -> list[PDF]:
+        pass
