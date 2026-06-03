@@ -1,5 +1,6 @@
 # STANDARD LIBRARY
 import time
+import os
 
 # THIRD-PARTY IMPORTS
 import win32com.client
@@ -57,7 +58,7 @@ class EmailMonitor:
                     messages = inbox.Items # assigning messages with everything inside that inbox
                     unread_messages = messages.Restrict("[Unread] = True") # assigning unread_messages with anything that is unread in the inbox folder
                     for unread_message in unread_messages: # for each unread_messages in the collection of unread_messages
-                        unread_email = Email( # assign unread_emails with a Email Class Object that parses the data into its parameters
+                        unread_email = Email( # assign unread_emails with an Email Class Object that parses the data into its parameters
                             message_id=unread_message.EntryID,
                             account=account,
                             sender=unread_message.SenderEmailAddress,
@@ -73,4 +74,56 @@ class EmailMonitor:
         return emails
 
     def save_attachments(self, email: Email) -> list[PDF]:
-        pass
+        """
+        Saves all PDF attachments from an email to the configured temp folder.
+
+        Iterates over all attachments on the given email. Raises ValueError if any
+        attachment is not a PDF, signaling the pipeline to route the email to manual
+        review. Successfully saved attachments are returned as PDF dataclass objects
+        with file_name and file_path populated. UCN and extracted_text are set to
+        None and resolved downstream.
+
+        Args:
+            email: The Email object whose attachments should be saved.
+
+        Returns:
+            A list of PDF objects representing the saved attachments.
+
+        Raises:
+            ValueError: If any attachment is not a PDF file.
+            ValueError: If there is any duplicate named file attachments.
+            LookupError: If the email cannot be located in Outlook by its message ID.
+            OSError: If an attachment cannot be saved to the temp folder.
+        """
+        pdfs = [] # 0. create an empty list
+
+        try:
+            mail_item = self.namespace.GetItemFromID(email.message_id) # 1. first get the email object
+        except Exception as item_id_error:
+            raise LookupError(f"Could not locate Item {email.message_id}. Error: {item_id_error}")
+
+        for attachment in mail_item.Attachments: # 2. for every email com object loop through the attachment com object and validate
+            if not attachment.FileName.lower().endswith(".pdf"):
+                raise ValueError(f"Attachment is not a PDF file: {attachment.FileName}")
+
+        seen_filenames = set()
+
+        for attachment in mail_item.Attachments: # 3. Loop again and save the attachments to temp folder
+                if attachment.FileName in seen_filenames:
+                    raise ValueError(f"Attachment {attachment.FileName} is already saved to {email.message_id}")
+                else:
+                    attachment_file_path = os.path.join(self.config.temp_folder, attachment.FileName)
+                    try:
+                        attachment.SaveAsFile(attachment_file_path)  # a. save each pdf to temp folder
+                        seen_filenames.add(attachment.FileName)
+
+                    except OSError as temp_folder_error:
+                        raise OSError(f"Could not save attachment to {self.config.temp_folder}. Error: {temp_folder_error}")
+                    pdf = PDF(    # b. make a pdf object
+                        file_name=attachment.FileName,
+                        file_path= attachment_file_path,
+                        ucn=None,
+                        extracted_text=None)
+                    pdfs.append(pdf) # c. append to results list
+
+        return pdfs # 4. return the result list
