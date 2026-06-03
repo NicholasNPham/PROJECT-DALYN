@@ -127,3 +127,20 @@ class EmailMonitor:
                     pdfs.append(pdf) # c. append to results list
 
         return pdfs # 4. return the result list
+
+    def move_email(self, email: Email, config: Config, is_completed: bool) -> None:
+
+        # 1. get the email com object from email
+        account = email.account
+        for store in self.namespace.Stores:
+            if store.DisplayName == account:
+                # 2. get the completed folder and manual review com object from the account object
+                #     a. pywintypes.com_error try/except ----- Need to do still
+                completed_folder = store.Folders[config.folder_completed]
+                manual_review_folder = store.Folders[config.folder_manual_review]
+        # 3. determine what is completed is since its boolean
+
+        #     a. if true move it over to completed folder using the completed folder com object
+        #         i. pywintypes.com_error try/except
+        #     b. if false move it to manual review folder using the manual review com object
+        #         i. pywintypes.com_error try/except
