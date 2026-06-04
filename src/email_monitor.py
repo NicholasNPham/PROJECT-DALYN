@@ -4,6 +4,7 @@ import os
 
 # THIRD-PARTY IMPORTS
 import win32com.client
+import pywintypes
 
 # LOCAL IMPORTS
 from models import Config, Email, PDF
@@ -129,18 +130,59 @@ class EmailMonitor:
         return pdfs # 4. return the result list
 
     def move_email(self, email: Email, config: Config, is_completed: bool) -> None:
+        """
+        Moves a processed email to the appropriate Outlook folder based on processing outcome.
 
-        # 1. get the email com object from email
-        account = email.account
+        Retrieves the mail item COM object using the email's message ID, locates the target
+        Outlook store by account name, and moves the email to either the completed or manual
+        review folder depending on the value of is_completed.
+
+        If a folder lookup fails, raises immediately. If the Move call fails, marks the email
+        as read, applies the configured error color category, saves the item, and raises so
+        the caller is aware the move did not succeed.
+
+        Args:
+            email: The Email dataclass representing the message to move.
+            config: The application configuration containing folder names and error category.
+            is_completed: If True, moves to folder_completed. If False, moves to folder_manual_review.
+
+        Raises:
+            pywintypes.com_error: If a folder cannot be found in the store, or if the Move call fails.
+        """
+        account = email.account # 1. get the email com object from email
         for store in self.namespace.Stores:
-            if store.DisplayName == account:
-                # 2. get the completed folder and manual review com object from the account object
-                #     a. pywintypes.com_error try/except ----- Need to do still
-                completed_folder = store.Folders[config.folder_completed]
-                manual_review_folder = store.Folders[config.folder_manual_review]
-        # 3. determine what is completed is since its boolean
+            if store.DisplayName == account: # 2. get the completed folder and manual review com object from the account object
+                try:
+                    completed_folder = store.Folders[config.folder_completed]
+                except pywintypes.com_error as completed_folder_error:
+                    print(f"Completed folder does not exist: {completed_folder_error}")
+                    raise
+                try:
+                    manual_review_folder = store.Folders[config.folder_manual_review]
+                except pywintypes.com_error as manual_review_folder_error:
+                    print(f"Manual review folder does not exist: {manual_review_folder_error}")
+                    raise
 
-        #     a. if true move it over to completed folder using the completed folder com object
-        #         i. pywintypes.com_error try/except
-        #     b. if false move it to manual review folder using the manual review com object
-        #         i. pywintypes.com_error try/except
+                email_item = self.namespace.GetItemFromID(email.message_id)
+
+                if is_completed: # 3. determine what is completed is since its boolean
+                    try: # a. if true move it over to completed folder using the completed folder com object
+                        email_item.Move(completed_folder)
+                    except pywintypes.com_error as email_item_completed_move_error:
+                        email_item.Unread = False
+                        email_item.Categories = config.email_move_error_color
+                        email_item.Save()
+                        print(f"Could not move to completed folder: {email_item_completed_move_error}")
+                        raise
+                else: # b. if false move it to manual review folder using the manual review com object
+                    try:
+                        email_item.Move(manual_review_folder)
+                    except pywintypes.com_error as email_item_manual_review_move_error:
+                        email_item.Unread = False
+                        email_item.Categories = config.email_move_error_color
+                        email_item.Save()
+                        print(f"Could not move to manual review folder: {email_item_manual_review_move_error}")
+                        raise
+                break # stops looping if found the store
+        else:
+            raise LookupError("Could not find Store")
