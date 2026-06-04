@@ -82,11 +82,11 @@ stac_url: "https://your-stac-url.com"
 ## Status
 
 | Module | Status |
-|---|---|
+|---|--|
 | `models.py` | Complete |
-| `email_monitor.py` | In progress |
+| `email_monitor.py` | Complete |
 | `ocr.py` | Not started |
-| `classifier.py` | Not started |
+| `classifier.py` | In progress |
 | `stac.py` | Not started |
 | `file_manager.py` | Not started |
 | `logger.py` | Not started |
