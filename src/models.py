@@ -71,6 +71,7 @@ class Config:
         stac_url: Base URL of the STAC web application used by the Selenium automation.
         outlook_retry_attempts: Number of times to retry connecting to Outlook before giving up
         outlook_retry_delay_seconds: Number of seconds to wait between each Outlook connection retry
+        email_move_error_color: Color of the error when it can not move to one of the finished folders
     """
     accounts: list[str]
     outlook_profile: str
@@ -83,3 +84,4 @@ class Config:
     stac_url: str
     outlook_retry_attempts: int
     outlook_retry_delay_seconds: int
+    email_move_error_color: str
