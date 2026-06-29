@@ -1,0 +1,54 @@
+# STANDARD LIBRARY IMPORTS
+from pathlib import Path
+
+# LOCAL FILE IMPORTS
+from models import ClassificationResult, Config
+
+# THIRD-PARTY IMPORTS
+from openpyxl import load_workbook
+
+def parse_phrases(excel_path: Path) -> dict[tuple[str, str], list[str]]:
+    """
+    Reads the DALYN Excel phrase sheet and builds a scoring dictionary.
+
+    Opens the workbook at the given path, iterates over every data row,
+    and groups phrases by their (type, subtype) pair. The Document Name
+    column is ignored. Each phrase is stored as-is; lowercasing happens
+    at match time in score_document.
+
+    Args:
+        excel_path: Path to the DALYN.xlsx file.
+
+    Returns:
+        A dictionary mapping (document_type, document_subtype) tuples
+        to a list of phrases belonging to that classification pair.
+
+    Raises:
+        FileNotFoundError: If the file at excel_path does not exist.
+        InvalidFileException: If the file is not a valid Excel workbook.
+    """
+
+    # LOCAL CONSTANTS
+    col_phrase = 1 # in the Excel, column b is the phrases
+    col_type = 2 # in the Excel, column c is the type
+    col_subtype = 3 # in the Excel, column d is the subtype
+
+    phrase_dict = {} # init an empty dictionary
+
+    workbook = load_workbook(excel_path) # load the Excel sheet
+    worksheet = workbook.active # make the worksheet in the workbook active
+
+    for row in worksheet.iter_rows(min_row=2): # loop through every row and skip the header row
+        phrase = row[col_phrase].value # init phrase_column and store the value in the cell for that row
+        doc_type = row[col_type].value # init type_column and store the value in the cell for that row
+        doc_subtype = row[col_subtype].value # init subtype_column and store the value in the cell for that row
+
+        if phrase is None or doc_type is None or doc_subtype is None: # if all three are none
+            continue # skip it by continuing it
+
+        key = (doc_type, doc_subtype) # init a tuple with type and subtype column values
+        if key not in phrase_dict: # if key is not in the phrase_dict dictionary as a key
+            phrase_dict[key] = [] # create a new key, (empty)value pair
+        phrase_dict[key].append(phrase) # if it is found then append the phrase column to the existing key
+
+    return phrase_dict
