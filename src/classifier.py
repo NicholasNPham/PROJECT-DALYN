@@ -2,7 +2,7 @@
 from pathlib import Path
 
 # LOCAL FILE IMPORTS
-from models import ClassificationResult, Config
+from models import ClassificationResult
 
 # THIRD-PARTY IMPORTS
 from openpyxl import load_workbook
@@ -52,3 +52,62 @@ def parse_phrases(excel_path: Path) -> dict[tuple[str, str], list[str]]:
         phrase_dict[key].append(phrase) # if it is found then append the phrase column to the existing key
 
     return phrase_dict
+
+def score_document(phrase_dict: dict[tuple[str, str], list[str]], whole_pdf_text: str) -> ClassificationResult:
+    """
+    Scores extracted PDF text against the phrase dictionary and returns a classification.
+
+    Iterates over every (type, subtype) pair and its associated phrases, checking
+    whether each phrase appears in the extracted text. Each match adds one point to
+    that pair's cumulative score. The pair with the highest score wins and populates
+    the returned ClassificationResult. Ties and zero matches result in a ClassificationResult
+    with no type or subtype set, signaling that the document requires manual review.
+
+    Both the extracted text and each phrase are lowercased before comparison to ensure
+    case-insensitive matching.
+
+    Args:
+        phrase_dict: A dictionary mapping (document_type, document_subtype) tuples
+                     to a list of phrases, as returned by parse_phrases.
+        whole_pdf_text: The full extracted text of the PDF document as a plain string.
+
+    Returns:
+        A ClassificationResult populated with the winning type, subtype, score,
+        and matched phrases. If no phrases matched or a tie occurred, document_type
+        and document_subtype will be None.
+    """
+
+    score_dict = {} # init score dictionary
+    matched_dict = {} # init match phrases dictionary
+
+    for type_and_subtype, phrases in phrase_dict.items(): # separate the type and subtype tuple and the phrases and init them
+        for phrase in phrases: # loop through phrases list
+            if phrase.lower() in whole_pdf_text.lower(): # check if phrase is in the whole pdf txt and lowercase
+
+                if type_and_subtype not in score_dict: # if the key is not in score dict
+                    score_dict[type_and_subtype] = 0 # create a new key value pair with value set to 0
+                score_dict[type_and_subtype] += 1 # add 1 to the key value pair if it exists
+
+                if type_and_subtype not in matched_dict: # if the key not in the matched dict
+                    matched_dict[type_and_subtype] = [] # create a new key value pair with a value set to an empty list
+                matched_dict[type_and_subtype].append(phrase) # append the phrase string to the list
+
+    if not score_dict: # if score dict is empty meaning no phrases were found and cant be scored
+        return ClassificationResult() # return an empty dataclass
+
+    winner_type_and_subtype = max(score_dict, key=lambda key: score_dict[key]) # look for the highest point and save the winner type and subtype this finds the first winner
+
+    winning_score = score_dict[winner_type_and_subtype] # store the winning score
+    tie_count = 0 # init tie count variable
+    for score in score_dict.values(): # loop through the score dict values
+        if score == winning_score: # if we find the score that matches the winning score
+            tie_count += 1 # add to the tie count list
+
+    if tie_count > 1: # if two types and subtype key wins
+        return ClassificationResult() # return an empty dataclass
+
+    return ClassificationResult(winner_type_and_subtype[0], # if only one wins, return a winning classification result.
+                                winner_type_and_subtype[1],
+                                score_dict[winner_type_and_subtype],
+                                matched_dict[winner_type_and_subtype],
+                                False)
