@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
 @dataclass
 class Email:
@@ -51,7 +52,8 @@ class ClassificationResult:
     """
     document_type: str | None = None
     document_subtype: str | None = None
-    score: float = 0.0
+    score: int = 0
+    matched_phrases: list[str] = field(default_factory=list)
     was_priority_override: bool = False
 
 @dataclass
@@ -78,7 +80,7 @@ class Config:
     folder_completed: str
     folder_manual_review: str
     temp_folder: str
-    excel_path: str
+    excel_path: Path
     log_path: str
     polling_interval_minutes: int
     stac_url: str
