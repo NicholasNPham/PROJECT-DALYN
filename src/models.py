@@ -48,13 +48,11 @@ class ClassificationResult:
         document_type: The broad category of the document (e.g. DEMAND, DISCOVERY), or None if unclassified.
         document_subtype: The specific subcategory of the document, or None if unclassified.
         score: Confidence score from the phrase matching algorithm.
-        was_priority_override: True if the classification was forced by a priority phrase match.
     """
     document_type: str | None = None
     document_subtype: str | None = None
     score: int = 0
     matched_phrases: list[str] = field(default_factory=list)
-    was_priority_override: bool = False
 
 @dataclass
 class Config:

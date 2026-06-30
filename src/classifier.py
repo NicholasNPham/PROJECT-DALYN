@@ -95,9 +95,24 @@ def score_document(phrase_dict: dict[tuple[str, str], list[str]], whole_pdf_text
     if not score_dict: # if score dict is empty meaning no phrases were found and cant be scored
         return ClassificationResult() # return an empty dataclass
 
-    winner_type_and_subtype = max(score_dict, key=lambda key: score_dict[key]) # look for the highest point and save the winner type and subtype this finds the first winner
+    """
+    max(score_dict, ..., ...): Iterates through the score_dict dictionary and returns the keys in the dictionary.
 
-    winning_score = score_dict[winner_type_and_subtype] # store the winning score
+    Note:
+    - LAMBDA: lambda is a tiny, throwaway function written inline, with no def and no name.
+    	
+    	def get_score(key):
+    		return score_dict[key]
+    	
+    	is the same as:
+    	
+    	lambda key: score_dict[key]
+
+    This line determines what each key has the highest value then stores the key(tuple) associated with the highest value
+    """ # This is for the line below to understand
+    winner_type_and_subtype = max(score_dict, key=lambda key: score_dict[key]) # look for the highest point and save the winner type and subtype this finds the first winner NOTE: returns the key/tuple of the winner
+
+    winning_score = score_dict[winner_type_and_subtype] # store the winning score example: int/2
     tie_count = 0 # init tie count variable
     for score in score_dict.values(): # loop through the score dict values
         if score == winning_score: # if we find the score that matches the winning score
@@ -106,8 +121,9 @@ def score_document(phrase_dict: dict[tuple[str, str], list[str]], whole_pdf_text
     if tie_count > 1: # if two types and subtype key wins
         return ClassificationResult() # return an empty dataclass
 
-    return ClassificationResult(winner_type_and_subtype[0], # if only one wins, return a winning classification result.
-                                winner_type_and_subtype[1],
-                                score_dict[winner_type_and_subtype],
-                                matched_dict[winner_type_and_subtype],
-                                False)
+    # if only one wins, return a winning classification result.
+    return ClassificationResult(
+        winner_type_and_subtype[0], # parameter of type
+        winner_type_and_subtype[1], # parameter of subtype
+        score_dict[winner_type_and_subtype], # parameter of the int score
+        matched_dict[winner_type_and_subtype]) # parameter of the whole phrase list
