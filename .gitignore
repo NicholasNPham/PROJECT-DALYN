@@ -1,2 +1,6 @@
 key.py
 NEW DALYN.xlsx
+__pycache__/
+*.pyc
+.idea/
+config/config.yaml
