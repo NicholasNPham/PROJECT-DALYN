@@ -48,6 +48,7 @@ class ClassificationResult:
         document_type: The broad category of the document (e.g. DEMAND, DISCOVERY), or None if unclassified.
         document_subtype: The specific subcategory of the document, or None if unclassified.
         score: Confidence score from the phrase matching algorithm.
+        matched_phrases: List of matched phrases
     """
     document_type: str | None = None
     document_subtype: str | None = None
