@@ -1,0 +1,7 @@
+msal>=1.29
+requests
+PyYAML
+PyMuPDF
+openpyxl
+selenium
+pytest
