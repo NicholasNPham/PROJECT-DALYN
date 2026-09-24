@@ -1,0 +1,42 @@
+# Copy to config.yaml and fill in. config.yaml is gitignored, never commit it.
+
+# Microsoft Graph app registration
+graph:
+  tenant_id: "PASTE-TENANT-ID"
+  client_id: "PASTE-CLIENT-ID"
+  client_secret: "PASTE-SECRET-VALUE"   # the secret Value, not the Secret ID
+
+# Mailboxes DALYN is permitted to touch. Full SMTP addresses, not aliases.
+# This list is the allowlist enforced in graph_client.py. Nothing outside it
+# can be reached, so add addresses here only when access is actually approved.
+mailboxes:
+  - "mailbox@example.com"
+
+# Which folder to read. Also hardcoded in graph_client.ALLOWED_FOLDERS as a
+# second gate, so changing this alone will not move DALYN to the Inbox.
+# Going to production requires a code change, on purpose.
+source_folder: "deleteditems"
+
+# Dry run: classify and log only. No STAC entry, no tagging, no moving.
+dry_run: true
+
+# Dry run window. Only mail received in the last N days is eligible.
+days_back: 2
+
+# Hard ceiling on how many emails one dry run pass touches. Sized so a
+# reviewer can check every decision by hand.
+max_messages: 50
+
+# Unused in the dry run. Belongs to the polling loop, which arrives with
+# dedup and STAC entry.
+max_emails_per_pass: 1
+
+# Newest first for testing, since recent mail is what staff can still verify.
+# Production reads oldest first.
+newest_first: true
+
+# Paths, relative to the project root
+paths:
+  logs: "logs"
+  temp: "temp"
+  excel: "Path/to/DALYN.xlsx"
