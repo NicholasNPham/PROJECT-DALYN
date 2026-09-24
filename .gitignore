@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.idea/
+.pytest_cache/
+.venv/
+config/config.yaml
+logs/
+temp/
+*.pfx
+*.cer
+*.xlsx
