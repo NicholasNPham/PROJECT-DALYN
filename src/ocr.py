@@ -2,6 +2,10 @@
 
 import io
 
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+
 import easyocr
 import pymupdf
 from pypdf import PdfReader
