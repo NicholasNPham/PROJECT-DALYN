@@ -217,7 +217,7 @@ class GraphClient:
         params = {
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
-            "$select": "id,receivedDateTime,hasAttachments",
+            "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview",
             "$top": max_messages,
         }
 
