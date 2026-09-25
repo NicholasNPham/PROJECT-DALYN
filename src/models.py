@@ -29,17 +29,29 @@ class ReviewTag:
 
 @dataclass
 class ClassificationResult:
-    """The outcome of scoring one PDF's text against the phrase sheet.
+    """The outcome of matching one document against the rules sheet.
 
-    A result with document_type set to None means no winner: either nothing
-    matched or two types tied. Either way the email goes to Manual Review.
+    document_type is None when no rule matched, or when the rule that matched
+    was left deliberately blank on the sheet. Both mean Manual Review;
+    matched_phrase tells the reviewer which of the two happened.
     """
 
     document_type: str | None = None
     document_subtype: str | None = None
-    score: int = 0
-    matched_phrases: list[str] = field(default_factory=list)
-    runner_up_score: int = 0
+    matched_phrase: str | None = None
+    matched_line: str | None = None
+    rule_row: int | None = None
+    similarity: float = 0.0
+
+    @property
+    def is_fuzzy(self) -> bool:
+        """True when this matched a mangled OCR line rather than the exact phrase."""
+        return bool(self.matched_phrase) and self.similarity < 1.0
+
+    @property
+    def is_classified(self) -> bool:
+        """True only when the document has both a Type and a Subtype for STAC."""
+        return bool(self.document_type and self.document_subtype)
 
 
 @dataclass
