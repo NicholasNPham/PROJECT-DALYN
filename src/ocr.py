@@ -3,9 +3,6 @@
 import io
 
 import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
-
 import easyocr
 import pymupdf
 from pypdf import PdfReader
@@ -13,6 +10,8 @@ from pypdf.errors import PdfReadError
 
 from exceptions import DocumentProblem
 from logger import get_logger
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 # Below this many characters per page, a PDF is treated as a scan rather than
 # a digital document. Digital orders from the e-filing portal run in the
