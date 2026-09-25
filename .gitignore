@@ -9,3 +9,5 @@ temp/
 *.pfx
 *.cer
 *.xlsx
+review_report.csv
+decisions_*.csv

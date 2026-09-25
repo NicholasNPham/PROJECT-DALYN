@@ -27,7 +27,7 @@ _READER = None
 logger = get_logger(__name__)
 
 
-def extract_text(pdf_bytes: bytes, filename: str) -> str:
+def extract_text(pdf_bytes: bytes, filename: str) -> tuple[str, str]:
     """Return the text of a PDF, using OCR only when there is no text layer.
 
     Args:
@@ -47,13 +47,12 @@ def extract_text(pdf_bytes: bytes, filename: str) -> str:
         logger.debug(
             "%s: %s chars from %s pages, embedded text", filename, len(text), page_count
         )
-        return text
+        return text, "embedded"
 
     logger.info(
         "%s: only %s chars from %s pages, needs OCR", filename, len(text), page_count
     )
-    return _ocr(pdf_bytes, filename)
-
+    return _ocr(pdf_bytes, filename), "ocr"
 
 def _extract_embedded(pdf_bytes: bytes, filename: str) -> tuple[str, int]:
     """Read the PDF's own text layer.
@@ -133,7 +132,7 @@ def _ocr(pdf_bytes: bytes, filename: str) -> str:
         for number, page in enumerate(document, start=1):
             try:
                 pixmap = page.get_pixmap(dpi=OCR_DPI)
-                lines = reader.readtext(pixmap.tobytes("png"), detail=0, paragraph=True)
+                lines = reader.readtext(pixmap.tobytes("png"), detail=0, paragraph=False)
                 pages.append("\n".join(lines))
             except Exception as error:
                 logger.warning(
