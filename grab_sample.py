@@ -25,8 +25,11 @@ client = GraphClient(
 )
 
 mailbox = config["mailboxes"][0]
-out = Path("temp/sample")
-out.mkdir(parents=True, exist_ok=True)
+out = Path("temp/sample7")
+
+if out.exists():
+    sys.exit(f"{out} already exists. Move or delete it first.")
+out.mkdir(parents=True)
 
 messages = client.list_messages(
     mailbox=mailbox,
@@ -37,15 +40,24 @@ messages = client.list_messages(
 
 saved = 0
 skipped = 0
+not_pdf = 0
 
 for index, message in enumerate(messages):
     for attachment in client.get_attachments(mailbox, message["id"]):
+        if not attachment["name"].lower().endswith(".pdf"):
+            not_pdf += 1
+            continue
+
         if "contentBytes" not in attachment:
-            print(f"{index:03d}: {attachment['name']} too large, skipped")
+            print(f"{index:03d}: {attachment['name']} has no contentBytes, SKIPPED")
             skipped += 1
             continue
+
         target = out / f"{index:03d}_{attachment['name']}"
+        if target.exists():
+            target = out / f"{index:03d}_dup{saved}_{attachment['name']}"
+
         target.write_bytes(base64.b64decode(attachment["contentBytes"]))
         saved += 1
 
-print(f"\n{saved} saved, {skipped} skipped, in {out.resolve()}")
+print(f"\n{saved} saved, {skipped} skipped (NO BYTES), {not_pdf} non-PDF, in {out.resolve()}")
