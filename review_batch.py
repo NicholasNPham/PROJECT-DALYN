@@ -25,6 +25,7 @@ import ucn  # noqa: E402
 from config_loader import load_config  # noqa: E402
 from exceptions import DocumentProblem  # noqa: E402
 from logger import setup_logging  # noqa: E402
+from exceptions import DocumentProblem, SystemProblem  # noqa: E402
 
 COLUMNS = (
     "file",
@@ -48,6 +49,15 @@ def main() -> int:
 
     config = load_config()
     setup_logging(config["paths"]["logs"])
+
+    config = load_config()
+    setup_logging(config["paths"]["logs"])
+
+    try:
+        ocr.configure_tesseract(config["paths"].get("tesseract"))
+    except SystemProblem as error:
+        print(error)
+        return 1
 
     rules_path = config["paths"]["excel"]
     rules = classifier.load_rules(rules_path)

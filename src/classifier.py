@@ -9,6 +9,10 @@ A rule matches when some line of the document STARTS WITH its phrase. That is
 what separates an order from a motion: a motion's body says "enter an order
 withdrawing counsel", but no line of it begins with "order", while a real
 order's title line does.
+
+The bottom row of the sheet is the safety net. It is tried only after every
+other rule has had its turn, exact and fuzzy both, so a catch-all phrase like
+CERTIFICATE OF SERVICE can never outrank a real title.
 """
 
 import re
@@ -27,7 +31,7 @@ from models import ClassificationResult
 RULES_SHEET = "Rules"
 
 # Column positions on the Rules sheet, zero-based.
-# Order | Phrase | TYPE | SUBTYPE | Notes
+# Order | Phrase | TYPE | SUBTYPE | Fuzzy? | Notes
 COL_PHRASE = 1
 COL_TYPE = 2
 COL_SUBTYPE = 3
@@ -38,12 +42,18 @@ COL_FUZZY = 4
 # "demandfordiscqvery", spaces lost and an o read as a q, which scores 0.944.
 #
 # 0.90 allows roughly one wrong character in ten. Measured against every line
-# of the 11 sample documents, nothing crossed it except true matches.
+# of the 62 batch 3 documents, nothing crossed it except true matches.
 FUZZY_THRESHOLD = 0.90
 
 # Below this many characters (spaces removed) a phrase is too short to fuzz:
 # short words have too many plausible near-misses. YES is ignored on them.
-MIN_FUZZY_LENGTH = 15
+#
+# 14, not 15, because NOTICE OF FILING and NOTICE OF TAKING are both exactly
+# 14 and both need it. Batch 3's 010_Order is a scanned notice of filing whose
+# heading OCR reads as "notce of filing", scoring 0.963, and the old floor of
+# 15 silently disabled the only rule that could catch it. ORDER at 5 and
+# MOTION at 6 stay exact-only, which is what this floor is really protecting.
+MIN_FUZZY_LENGTH = 14
 
 logger = get_logger(__name__)
 
@@ -68,9 +78,14 @@ def normalize(text: str) -> str:
     into a space, and collapses runs of whitespace. This is why Dalyn does not
     have to care about capitals, apostrophes, commas, colons or double spaces
     when she writes a phrase, and why OCR spacing quirks do not cause misses.
+
+    Note that an apostrophe becomes a space, so DEFENDANT'S normalizes to
+    "defendant s" and will NOT match a document that prints DEFENDANTS. Write
+    such phrases without the apostrophe and mark them Fuzzy, since the fuzzy
+    pass compares with spaces removed and so accepts both spellings.
     """
-    text = text.replace("\u2019", "'").replace("\u2018", "'")
-    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("’", "'").replace("‘", "'")
+    text = text.replace("“", '"').replace("”", '"')
     text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
     return re.sub(r"\s+", " ", text).strip()
 
@@ -102,6 +117,7 @@ def load_rules(excel_path: Path) -> list[Rule]:
     Returns:
         Rules in the order they will be tried. A rule with a blank Type and
         Subtype is kept: it means "recognized, but send it to a person".
+        The LAST rule returned is treated as the safety net by classify().
 
     Raises:
         SystemProblem: If the file is missing, unreadable, has no Rules sheet,
@@ -191,12 +207,34 @@ def load_rules(excel_path: Path) -> list[Rule]:
 
     _warn_on_shadowed_rules(rules)
 
-    logger.info("Loaded %s rules from %s", len(rules), excel_path)
+    nets = [rule.phrase for rule in rules if not rule.document_type]
+    logger.info(
+        "Loaded %s rules from %s. Safety nets, tried last: %s",
+        len(rules),
+        excel_path,
+        ", ".join(repr(phrase) for phrase in nets) if nets else "none",
+    )
     return rules
 
 
 def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
     """Return the Type and Subtype for one document, or an empty result.
+
+    Three passes, in this order:
+
+        1. Exact, over every rule that files to a real Type.
+        2. Fuzzy, over those same rules where Fuzzy? is YES.
+        3. The safety-net rules, exact then fuzzy.
+
+    A safety net is any rule with a blank TYPE and SUBTYPE. It is held back
+    because a net that competes in pass one is not a net: a phrase that appears
+    in the body of nearly every filing would win pass one outright on a scan
+    whose heading OCR mangled slightly, and the specific rule that would have
+    matched in pass two would never be reached. Batch 3's 029_Notice Of
+    Appearance did exactly that, losing at 0.944 to a catch-all.
+
+    A sheet with no blank rules has no safety net and this collapses to the
+    ordinary two passes.
 
     Args:
         rules: Rules from load_rules, already in priority order.
@@ -209,14 +247,41 @@ def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
     """
     lines = document_lines(document_text)
 
-    # Pass one: exact. Every rule gets a clean shot before any fuzzing happens,
-    # so a document DALYN already reads correctly is never touched by pass two.
+    contenders = [rule for rule in rules if rule.document_type]
+    safety_nets = [rule for rule in rules if not rule.document_type]
+
+    result = _match_exact(contenders, lines) or _match_fuzzy(contenders, lines)
+    if result is not None:
+        return result
+
+    if safety_nets:
+        result = _match_exact(safety_nets, lines) or _match_fuzzy(safety_nets, lines)
+        if result is not None:
+            logger.info(
+                "No rule matched a title line. Falling back to rules row %s (%r).",
+                result.rule_row,
+                result.matched_phrase,
+            )
+            return result
+
+    return ClassificationResult()
+
+
+def _match_exact(rules: list[Rule], lines: list[str]) -> ClassificationResult | None:
+    """Return the first rule whose phrase starts a line, or None."""
     for rule in rules:
         for line in lines:
             if line.startswith(rule.normalized):
                 return _result(rule, line, 1.0)
+    return None
 
-    # Pass two: the rules Dalyn marked Fuzzy, still in priority order.
+
+def _match_fuzzy(rules: list[Rule], lines: list[str]) -> ClassificationResult | None:
+    """Return the best near-match for the highest fuzzy rule that has one.
+
+    Priority beats similarity: once a higher rule has any acceptable match, a
+    lower rule cannot outrank it on score alone.
+    """
     best: tuple[Rule, str, float] | None = None
 
     for rule in rules:
@@ -227,22 +292,20 @@ def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
             if similarity >= FUZZY_THRESHOLD and (best is None or similarity > best[2]):
                 best = (rule, line, similarity)
         if best is not None:
-            # Priority beats similarity: once a higher rule has any acceptable
-            # match, a lower rule cannot outrank it on score alone.
             break
 
-    if best is not None:
-        rule, line, similarity = best
-        logger.info(
-            "Fuzzy match at %.0f%%: rules row %s (%r) matched %r",
-            similarity * 100,
-            rule.row,
-            rule.phrase,
-            line,
-        )
-        return _result(rule, line, similarity)
+    if best is None:
+        return None
 
-    return ClassificationResult()
+    rule, line, similarity = best
+    logger.info(
+        "Fuzzy match at %.0f%%: rules row %s (%r) matched %r",
+        similarity * 100,
+        rule.row,
+        rule.phrase,
+        line,
+    )
+    return _result(rule, line, similarity)
 
 
 def _similarity(rule_compressed: str, line_compressed: str) -> float:
@@ -251,6 +314,11 @@ def _similarity(rule_compressed: str, line_compressed: str) -> float:
     Only the leading characters of the line are compared, mirroring the exact
     pass. Without that, a long paragraph containing the phrase somewhere in the
     middle would score as a title line.
+
+    A consequence worth knowing when writing rules: because the score is a
+    fraction of the phrase's length, a LONGER phrase tolerates more OCR errors,
+    not fewer. WAIVER OF DEFENDANT scores 0.82 against a badly scanned heading
+    that WAIVER OF DEFENDANTS PRESENCE AT PRETRIAL CONFERENCE scores 0.94 on.
     """
     if not line_compressed:
         return 0.0
@@ -269,6 +337,7 @@ def _result(rule: Rule, line: str, similarity: float) -> ClassificationResult:
         similarity=similarity,
     )
 
+
 def _cell(row: tuple, index: int) -> str | None:
     """Return a trimmed, upper-cased cell value, or None if it is blank."""
     if len(row) <= index or row[index] is None:
@@ -282,9 +351,14 @@ def _warn_on_shadowed_rules(rules: list[Rule]) -> None:
 
     'DEMAND FOR DISCOVERY' above 'DEMAND FOR DISCOVERY AND INSPECTION' means the
     second never runs. The sheet still loads, because the fix is Dalyn's to make.
+
+    Safety-net rules are skipped: they are meant to be shadowed by everything
+    above them.
     """
-    for position, rule in enumerate(rules):
-        for earlier in rules[:position]:
+    contenders = [rule for rule in rules if rule.document_type]
+
+    for position, rule in enumerate(contenders):
+        for earlier in contenders[:position]:
             if rule.normalized.startswith(earlier.normalized):
                 logger.warning(
                     "Rules row %s (%r) can never match: row %s (%r) sits above it and "
