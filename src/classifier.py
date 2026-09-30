@@ -10,6 +10,10 @@ what separates an order from a motion: a motion's body says "enter an order
 withdrawing counsel", but no line of it begins with "order", while a real
 order's title line does.
 
+Three phrases are exceptions: ORDER, MOTION and JUDGMENT exist to catch titles
+they cannot name, so they only look at the first TITLE_REGION_LINES lines,
+where a title can actually be. Everywhere else they do more harm than good.
+
 The bottom row of the sheet is the safety net. It is tried only after every
 other rule has had its turn, exact and fuzzy both, so a catch-all phrase like
 CERTIFICATE OF SERVICE can never outrank a real title.
@@ -55,6 +59,22 @@ FUZZY_THRESHOLD = 0.90
 # MOTION at 6 stay exact-only, which is what this floor is really protecting.
 MIN_FUZZY_LENGTH = 14
 
+# The catch-all rules exist to recognise a title they cannot name, so they are
+# confined to where a title can actually be: the top of the first page, below
+# the caption. Everywhere else they are a liability. A memorandum of law is
+# nothing but quoted rulings, so "Judgment", "Order" and "Motion" start lines
+# throughout it; batch 9's 027_Memorandum Of Law is 61,000 characters and was
+# filed COURT/ORDER off a citation on some page in the middle.
+#
+# Every other rule names a specific document and still matches anywhere, which
+# the office requires: a demand for discovery wins wherever it appears.
+#
+# 25 lines is about double the longest caption seen so far (batch 8's
+# 002_Motion To Consolidate carries six case numbers and puts its title on
+# line 11).
+TITLE_REGION_LINES = 25
+TITLE_ONLY_PHRASES = frozenset({"order", "motion", "judgment", "memorandum of law"})
+
 logger = get_logger(__name__)
 
 
@@ -68,6 +88,7 @@ class Rule:
     document_type: str | None
     document_subtype: str | None
     fuzzy: bool
+    title_only: bool
     row: int
 
 
@@ -195,6 +216,7 @@ def load_rules(excel_path: Path) -> list[Rule]:
                     document_type=document_type,
                     document_subtype=document_subtype,
                     fuzzy=fuzzy,
+                    title_only=normalized in TITLE_ONLY_PHRASES,
                     row=row_number,
                 )
             )
@@ -246,16 +268,21 @@ def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
         email goes to Manual Review, and matched_phrase says which happened.
     """
     lines = document_lines(document_text)
+    title_lines = lines[:TITLE_REGION_LINES]
 
     contenders = [rule for rule in rules if rule.document_type]
     safety_nets = [rule for rule in rules if not rule.document_type]
 
-    result = _match_exact(contenders, lines) or _match_fuzzy(contenders, lines)
+    result = _match_exact(contenders, lines, title_lines) or _match_fuzzy(
+        contenders, lines, title_lines
+    )
     if result is not None:
         return result
 
     if safety_nets:
-        result = _match_exact(safety_nets, lines) or _match_fuzzy(safety_nets, lines)
+        result = _match_exact(safety_nets, lines, title_lines) or _match_fuzzy(
+            safety_nets, lines, title_lines
+        )
         if result is not None:
             logger.info(
                 "No rule matched a title line. Falling back to rules row %s (%r).",
@@ -267,27 +294,36 @@ def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
     return ClassificationResult()
 
 
-def _match_exact(rules: list[Rule], lines: list[str]) -> ClassificationResult | None:
-    """Return the first rule whose phrase starts a line, or None."""
+def _match_exact(
+    rules: list[Rule], lines: list[str], title_lines: list[str]
+) -> ClassificationResult | None:
+    """Return the first rule whose phrase starts a line, or None.
+
+    A title-only rule sees just the first TITLE_REGION_LINES lines.
+    """
     for rule in rules:
-        for line in lines:
+        for line in title_lines if rule.title_only else lines:
             if line.startswith(rule.normalized):
                 return _result(rule, line, 1.0)
     return None
 
 
-def _match_fuzzy(rules: list[Rule], lines: list[str]) -> ClassificationResult | None:
+def _match_fuzzy(
+    rules: list[Rule], lines: list[str], title_lines: list[str]
+) -> ClassificationResult | None:
     """Return the best near-match for the highest fuzzy rule that has one.
 
     Priority beats similarity: once a higher rule has any acceptable match, a
     lower rule cannot outrank it on score alone.
+
+    A title-only rule sees just the first TITLE_REGION_LINES lines.
     """
     best: tuple[Rule, str, float] | None = None
 
     for rule in rules:
         if not rule.fuzzy:
             continue
-        for line in lines:
+        for line in title_lines if rule.title_only else lines:
             similarity = _similarity(rule.compressed, compress(line))
             if similarity >= FUZZY_THRESHOLD and (best is None or similarity > best[2]):
                 best = (rule, line, similarity)

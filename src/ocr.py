@@ -67,12 +67,11 @@ MIN_WORDS_TO_JUDGE = 20
 # below, and every correctly structured one scored 4.02 or above.
 MIN_WORDS_PER_LINE = 2.0
 
-# Everyday English plus the vocabulary every court filing repeats. This does not
-# need to be long or clever. It only has to be words a working text layer cannot
-# avoid producing.
 # Everyday English first, then the vocabulary court filings repeat. The
 # everyday half matters: a report or a letter is prose, and a list of only
-# court terms scores those documents as though they were corrupt.
+# court terms scores those documents as though they were corrupt. This does not
+# need to be long or clever. It only has to be words a working text layer
+# cannot avoid producing.
 COMMON_WORDS = frozenset({
     "the", "of", "and", "to", "in", "is", "that", "for", "on", "this",
     "by", "with", "as", "be", "at", "it", "was", "were", "will", "not",
@@ -117,6 +116,11 @@ TESSERACT_CONFIG = "--psm 3"
 UNDERLINE_MIN_WIDTH = 120
 UNDERLINE_THICKEN = 3
 
+# The retry exists to re-read a corrupt heading, and a heading is on page one.
+# Rasterising a 60-page transcript to find one is pure waste: batch 9's 20-page
+# memorandum cost 41 seconds and still matched nothing.
+FORCE_OCR_PAGE_LIMIT = 3
+
 logger = get_logger(__name__)
 
 
@@ -146,12 +150,17 @@ def configure_tesseract(tesseract_path=None) -> None:
     logger.info("Tesseract %s ready", version)
 
 
-def extract_text(pdf_bytes: bytes, filename: str) -> tuple[str, str]:
+def extract_text(pdf_bytes: bytes, filename: str, force_ocr: bool = False) -> tuple[str, str]:
     """Return the text of a PDF, using OCR only when the text layer is unusable.
 
     Args:
         pdf_bytes: Raw PDF file content.
         filename: Attachment name, used for logging and error messages only.
+        force_ocr: Skip the text layer and go straight to OCR. Used to retry a
+            document that classified to nothing, which happens when a heading is
+            corrupt but the body is clean enough to pass the usability checks.
+            Only the first FORCE_OCR_PAGE_LIMIT pages are read, since that retry
+            is only ever looking for a heading.
 
     Returns:
         A tuple of the document's text and where it came from, either
@@ -162,6 +171,14 @@ def extract_text(pdf_bytes: bytes, filename: str) -> tuple[str, str]:
             no usable text even after OCR.
         SystemProblem: If Tesseract itself is unavailable.
     """
+    if force_ocr:
+        logger.info(
+            "%s: forced OCR of the first %s pages, skipping the text layer",
+            filename,
+            FORCE_OCR_PAGE_LIMIT,
+        )
+        return _ocr(pdf_bytes, filename, page_limit=FORCE_OCR_PAGE_LIMIT), "ocr"
+
     text, page_count = _extract_embedded(pdf_bytes, filename)
 
     if _has_usable_text(text, page_count):
@@ -251,6 +268,10 @@ def _is_readable(text: str) -> bool:
     Too few words per line means the extractor emitted one word per line. Every
     word is correct and every line is useless, because a rule matches the start
     of a line and no line is a title any more.
+
+    Note that all three read the whole document. A document whose body is clean
+    but whose heading is corrupt passes every check and then matches no rule at
+    all; that case is handled by the caller retrying with force_ocr.
     """
     words = [word for word in re.findall(r"[a-z]+", text.lower()) if len(word) > 1]
 
@@ -285,7 +306,7 @@ def _is_readable(text: str) -> bool:
     return True
 
 
-def _ocr(pdf_bytes: bytes, filename: str) -> str:
+def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None) -> str:
     """Read a scanned PDF by rendering its pages and running Tesseract on them.
 
     Slower than reading a text layer, roughly five to ten seconds per page.
@@ -294,6 +315,8 @@ def _ocr(pdf_bytes: bytes, filename: str) -> str:
     Args:
         pdf_bytes: Raw PDF file content.
         filename: Attachment name, for logging and error messages.
+        page_limit: Stop after this many pages. None reads the whole document.
+            Used by the forced retry, which is only ever looking for a heading.
 
     Returns:
         The OCR'd text, pages joined by newlines.
@@ -313,6 +336,9 @@ def _ocr(pdf_bytes: bytes, filename: str) -> str:
 
     with document:
         for number, page in enumerate(document, start=1):
+            if page_limit is not None and number > page_limit:
+                break
+
             try:
                 image = _page_image(page.get_pixmap(dpi=OCR_DPI), filename, number)
                 pages.append(pytesseract.image_to_string(image, config=TESSERACT_CONFIG))

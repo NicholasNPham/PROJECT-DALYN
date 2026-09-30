@@ -25,7 +25,7 @@ client = GraphClient(
 )
 
 mailbox = config["mailboxes"][0]
-out = Path("temp/sample7")
+out = Path("temp/sample10")
 
 if out.exists():
     sys.exit(f"{out} already exists. Move or delete it first.")

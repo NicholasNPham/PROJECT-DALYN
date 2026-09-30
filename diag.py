@@ -9,6 +9,10 @@ Answers the three questions that keep coming up:
     Did it read the document, or read garbage and not notice?
     Which rule won, and on which line?
     For a rule that should have won, how close did it get?
+
+This mirrors review_batch.py deliberately, including the OCR retry on a
+no-match and the title-region limit on the catch-all rules. When the two
+disagree, the bug is here, not in the pipeline.
 """
 
 import re
@@ -49,8 +53,29 @@ def main() -> int:
         print(f"No PDFs in {target}")
         return 2
 
-    rules = classifier.load_rules(load_config()["paths"]["excel"])
-    print(f"{len(rules)} rules loaded. Safety net is row {rules[-1].row} ({rules[-1].phrase!r}).")
+    config = load_config()
+
+    # review_batch.py does this before reading anything. Without it, any
+    # document that needs OCR dies on "Tesseract is not installed".
+    try:
+        ocr.configure_tesseract(config["paths"].get("tesseract"))
+    except DalynError as error:
+        print(error)
+        return 1
+
+    rules = classifier.load_rules(config["paths"]["excel"])
+
+    nets = [rule for rule in rules if not rule.document_type]
+    print(
+        f"{len(rules)} rules loaded. Safety nets, tried last: "
+        f"{', '.join(repr(rule.phrase) for rule in nets) if nets else 'none'}"
+    )
+
+    title_only = [rule.phrase for rule in rules if rule.title_only]
+    print(
+        f"Title-only rules, limited to the first {classifier.TITLE_REGION_LINES} lines: "
+        f"{', '.join(repr(p) for p in title_only) if title_only else 'none'}"
+    )
 
     for pdf in pdfs:
         print()
@@ -68,7 +93,18 @@ def main() -> int:
 def report(pdf: Path, rules: list, keyword: str | None, show_lines: bool) -> None:
     """Print the extraction, the decision, and the near misses for one PDF."""
     text, source = extract_text(pdf.read_bytes(), pdf.name)
+    result = classifier.classify(rules, text)
+
+    # review_batch.py retries a no-match through OCR, because a clean body can
+    # carry a corrupt heading and pass the usability checks. Mirror that here or
+    # diag will report Manual Review on documents the pipeline classifies.
+    if not result.matched_phrase and source == "embedded":
+        print("  no rule matched the text layer, retrying with OCR\n")
+        text, source = extract_text(pdf.read_bytes(), pdf.name, force_ocr=True)
+        result = classifier.classify(rules, text)
+
     lines = classifier.document_lines(text)
+    title_lines = lines[: classifier.TITLE_REGION_LINES]
 
     words = [w for w in re.findall(r"[a-z]+", text.lower()) if len(w) > 1]
     raw_lines = sum(1 for line in text.splitlines() if line.strip())
@@ -87,16 +123,16 @@ def report(pdf: Path, rules: list, keyword: str | None, show_lines: bool) -> Non
     else:
         print("  (no usable text layer, this went through OCR)")
 
-    print("\n  first 12 lines:")
-    for index, line in enumerate(lines[:12]):
+    # The title region is what the catch-all rules see, so show its whole
+    # extent rather than an arbitrary dozen lines.
+    print(f"\n  title region, the first {len(title_lines)} lines:")
+    for index, line in enumerate(title_lines):
         print(f"    {index:3} {line[:92]!r}")
 
-    if show_lines and len(lines) > 12:
+    if show_lines and len(lines) > len(title_lines):
         print("\n  remaining lines:")
-        for index, line in enumerate(lines[12:], start=12):
+        for index, line in enumerate(lines[len(title_lines):], start=len(title_lines)):
             print(f"    {index:3} {line[:92]!r}")
-
-    result = classifier.classify(rules, text)
 
     print("\n  DECISION:")
     if result.matched_phrase is None:
@@ -115,8 +151,11 @@ def report(pdf: Path, rules: list, keyword: str | None, show_lines: bool) -> Non
     print("\n  how close every other rule got (best line per rule):")
     scored = []
     for rule in rules:
+        # A title-only rule never looks past the title region, so scoring it
+        # against the whole document would show matches that cannot happen.
+        searchable = title_lines if rule.title_only else lines
         best_line, best_score = "", 0.0
-        for line in lines:
+        for line in searchable:
             if line.startswith(rule.normalized):
                 best_line, best_score = line, 1.0
                 break
@@ -139,7 +178,8 @@ def report(pdf: Path, rules: list, keyword: str | None, show_lines: bool) -> Non
             verdict = "over the fuzzy threshold"
         else:
             verdict = f"under the {classifier.FUZZY_THRESHOLD:.2f} threshold"
-        print(f"    {score:.3f}  row {rule.row:3} {rule.phrase[:40]:42} {verdict}")
+        scope = " [title region only]" if rule.title_only else ""
+        print(f"    {score:.3f}  row {rule.row:3} {rule.phrase[:40]:42} {verdict}{scope}")
         print(f"           vs {line[:86]!r}")
 
 
