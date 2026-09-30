@@ -109,6 +109,20 @@ def _review_one(pdf: Path, rules: list) -> dict:
     row["ucn"] = ucn.find_ucn(text) or ""
 
     result = classifier.classify(rules, text)
+
+    # A clean body can carry a corrupt heading, which passes the usability
+    # checks but leaves nothing for a rule to match. Retry once through OCR.
+    if not result.matched_phrase and source == "embedded":
+        try:
+            text, source = ocr.extract_text(pdf.read_bytes(), pdf.name, force_ocr=True)
+        except DocumentProblem:
+            pass
+        else:
+            row["text_source"] = source
+            row["char_count"] = len(text)
+            row["ucn"] = ucn.find_ucn(text) or row["ucn"]
+            result = classifier.classify(rules, text)
+
     row["matched_phrase"] = result.matched_phrase or ""
     row["matched_line"] = (result.matched_line or "")[:80]
     row["rule_row"] = result.rule_row or ""
@@ -136,7 +150,6 @@ def _review_one(pdf: Path, rules: list) -> dict:
         row["reason"] = "Classified, but no UCN in the document"
 
     return row
-
 
 def _print_table(rows: list[dict]) -> None:
     print(f"\n{'FILE':44} {'TYPE':10} {'SUBTYPE':9} {'SRC':8} {'MATCH':10} {'MATCHED ON':24} OUTCOME")
