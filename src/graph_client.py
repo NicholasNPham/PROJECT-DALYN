@@ -13,6 +13,16 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 
 ALLOWED_FOLDERS = frozenset({"deleteditems"})
+
+# How many messages to ask Graph for per page. Graph caps this at 1000 for
+# messages and may return fewer whatever is asked for, which is exactly why
+# @odata.nextLink has to be followed rather than trusting one big $top.
+PAGE_SIZE = 100
+
+# A folder of 100,000 messages would be 1000 pages. Anything past this is a
+# loop or a mailbox nobody expected, and either way running forever is worse
+# than stopping loudly.
+MAX_PAGES = 200
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 300
 
@@ -195,20 +205,25 @@ class GraphClient:
             self,
             mailbox: str,
             days_back: int,
-            max_messages: int,
+            max_messages: int | None = None,
             newest_first: bool = True,
     ) -> list[dict]:
-        """Return recent messages from Deleted Items, attachments or not.
+        """Return messages from the source folder, following Graph's paging.
 
-        Deliberately single-page. The dry run is bounded by max_messages so a
-        reviewer can check every decision by hand, and paging past that ceiling
-        would defeat the point. Paging arrives with the polling loop.
+        Graph never returns a whole folder at once. It answers with one page
+        and, when there is more, an @odata.nextLink to continue from. This
+        follows that link until it stops coming, or until max_messages is
+        reached.
 
         Args:
             mailbox: SMTP address of the mailbox to read.
             days_back: Only consider mail received within this many days.
-            max_messages: Hard ceiling on how many messages to return.
-            newest_first: Sort order. True for dry runs, False for production.
+            max_messages: Stop after this many. None means the whole folder,
+                which is what production wants: the Inbox is the work queue,
+                and anything left in it is unprocessed.
+            newest_first: Sort order. True for dry runs, since recent mail is
+                what staff can still verify. False for production, so nothing
+                ages out while newer mail jumps the queue.
 
         Returns:
             Message dicts with id, receivedDateTime, hasAttachments, subject,
@@ -216,7 +231,8 @@ class GraphClient:
 
         Raises:
             SystemProblem: If the mailbox or folder is not on the allowlist,
-                or if Graph returns an unrecoverable error.
+                if Graph returns an unrecoverable error, or if paging runs
+                past MAX_PAGES.
             GraphAuthError: If the credential is rejected.
         """
         cutoff = (
@@ -230,18 +246,37 @@ class GraphClient:
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
             "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview,body",
-            "$top": max_messages,
+            "$top": min(max_messages, PAGE_SIZE) if max_messages else PAGE_SIZE,
         }
 
         # Plain text rather than HTML, so a UCN split across tags or
         # entities still reads as one run of characters.
-        response = self._request(
-            "GET",
-            url,
-            params=params,
-            headers={"Prefer": 'outlook.body-content-type="text"'},
-        )
-        messages = response.json().get("value", [])
+        headers = {"Prefer": 'outlook.body-content-type="text"'}
+
+        messages: list[dict] = []
+        pages = 0
+
+        while url:
+            pages += 1
+            if pages > MAX_PAGES:
+                raise SystemProblem(
+                    f"Paging past {MAX_PAGES} pages in {mailbox}. Either the folder is "
+                    "far bigger than expected or Graph is looping; stopping rather than "
+                    "running forever."
+                )
+
+            response = self._request("GET", url, params=params, headers=headers)
+            payload = response.json()
+            messages.extend(payload.get("value", []))
+
+            if max_messages and len(messages) >= max_messages:
+                messages = messages[:max_messages]
+                break
+
+            # nextLink already carries every query option, so params must not
+            # be sent again or Graph rejects the request.
+            url = payload.get("@odata.nextLink")
+            params = None
 
         # Everything is returned, including mail Graph says has no attachments.
         # Filtering here would drop such mail silently: no row, no log line,
@@ -251,10 +286,13 @@ class GraphClient:
         without = sum(1 for message in messages if not message.get("hasAttachments"))
 
         logger.info(
-            "Listed %s messages from %s (last %s days), %s with no attachments",
+            "Listed %s messages from %s (last %s days, %s page%s, %s), %s with no attachments",
             len(messages),
             mailbox,
             days_back,
+            pages,
+            "" if pages == 1 else "s",
+            "newest first" if newest_first else "oldest first",
             without,
         )
 
