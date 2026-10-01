@@ -198,7 +198,7 @@ class GraphClient:
             max_messages: int,
             newest_first: bool = True,
     ) -> list[dict]:
-        """Return recent messages from Deleted Items that carry attachments.
+        """Return recent messages from Deleted Items, attachments or not.
 
         Deliberately single-page. The dry run is bounded by max_messages so a
         reviewer can check every decision by hand, and paging past that ceiling
@@ -213,7 +213,6 @@ class GraphClient:
         Returns:
             Message dicts with id, receivedDateTime, hasAttachments, subject,
             bodyPreview, and body (the full body, as plain text).
-            Possibly fewer than max_messages once attachment-less mail is dropped.
 
         Raises:
             SystemProblem: If the mailbox or folder is not on the allowlist,
@@ -244,17 +243,22 @@ class GraphClient:
         )
         messages = response.json().get("value", [])
 
-        with_attachments = [m for m in messages if m.get("hasAttachments")]
+        # Everything is returned, including mail Graph says has no attachments.
+        # Filtering here would drop such mail silently: no row, no log line,
+        # nothing for anyone to notice. Upstream rules mean it should be rare,
+        # but when it happens a person has to see it, so it goes through and
+        # comes out as NO_FILES.
+        without = sum(1 for message in messages if not message.get("hasAttachments"))
 
         logger.info(
-            "Listed %s messages from %s (last %s days), %s with attachments",
+            "Listed %s messages from %s (last %s days), %s with no attachments",
             len(messages),
             mailbox,
             days_back,
-            len(with_attachments),
+            without,
         )
 
-        return with_attachments
+        return messages
 
     def get_folder_id(self, mailbox: str, folder: str) -> str:
         """Return Graph's ID for a well-known folder such as deleteditems or inbox.

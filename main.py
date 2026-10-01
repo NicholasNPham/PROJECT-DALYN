@@ -46,6 +46,11 @@ CSV_COLUMNS = (
     "mailbox",
     "message_id",
     "received_utc",
+    "email_number",
+    "email_type",
+    "attachment",
+    "email_decision",
+    "email_reason",
     "attachment_name",
     "size_bytes",
     "ucn",
@@ -72,6 +77,25 @@ CSV_COLUMNS = (
 PDF_MAGIC = b"%PDF-"
 PDF_HEADER_WINDOW = 1024
 
+# TEMPORARY, 1 Oct 2026. UCN_PATTERN in ucn.py ends in exactly two letters,
+# but Hardee uses three-letter division codes, so a Hardee number comes back
+# with its last letter missing: 25-2026-MM-000464-A000-XXW reads as
+# ...A000XX. That is a WRONG case number, not a missing one, and nothing
+# downstream can tell the difference. Until the pattern is fixed, anything
+# whose county code is not Polk goes to a person instead.
+#   53 Polk, 25 Hardee, 28 Highlands
+# Remove this and the UCN_OTHER_COUNTY outcome once ucn.py handles three-
+# letter divisions.
+SUPPORTED_COUNTY_CODES = frozenset({"53"})
+
+# Where any attachment goes that has a usable case number but matched no
+# rule. Confirmed by Nick on 1 Oct 2026 as a real STAC Type/Subtype pair.
+# Cover letters and similar one-off correspondence vary too much to write
+# rules for, so they are entered on the case and sorted out inside STAC
+# rather than handed back to a person in Outlook.
+PLS_RVW_TYPE = "PLS"
+PLS_RVW_SUBTYPE = "RVW"
+
 # Anything bigger is skipped rather than OCR'd. Arbitrary; revisit once the
 # dry run shows what real filings weigh.
 MAX_PDF_BYTES = 25 * 1024 * 1024
@@ -83,10 +107,15 @@ class Outcome:
     Precedence, highest first. An attachment gets exactly one outcome:
         TOO_LARGE, NON_PDF, UNREADABLE   no text, nothing to classify
         NO_UCN                           nowhere to enter it, even if classified
+        UCN_OTHER_COUNTY                 the case number is not Polk, so it cannot
+                                         be trusted until the Hardee pattern in
+                                         ucn.py is fixed (temporary)
         UCN_CONFLICT                     the email and the document name different
                                          cases, or a document with no email UCN
                                          names several
-        NO_MATCH                         no rule matched, or only a safety net did
+        PLS_RVW                          no rule matched, but it has a usable case
+                                         number, so it is entered under PLS/RVW
+                                         for a person to sort out inside STAC
         WOULD_ENTER                      classified and a UCN
 
     GONE is email-level, like NO_FILES: the email left the source folder
@@ -101,12 +130,34 @@ class Outcome:
     WOULD_ENTER = "WOULD_ENTER"
     NO_UCN = "NO_UCN"
     UCN_CONFLICT = "UCN_CONFLICT"
-    NO_MATCH = "NO_MATCH"
+    UCN_OTHER_COUNTY = "UCN_OTHER_COUNTY"
+    PLS_RVW = "PLS_RVW"
     UNREADABLE = "UNREADABLE"
     NON_PDF = "NON_PDF"
     TOO_LARGE = "TOO_LARGE"
     NO_FILES = "NO_FILES"
     GONE = "GONE"
+
+
+class EmailDecision:
+    """What production DALYN would do with the whole email.
+
+    All-or-nothing, for now: an email is uploaded only if every attachment
+    on it is WOULD_ENTER. If any one is not, the whole email goes to Manual
+    Review and nothing on it is entered, so a person never has to work out
+    which attachments DALYN already put in STAC. Switching to Partial is a
+    change to _decide_email alone.
+    """
+
+    UPLOAD = "UPLOAD"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+    GONE = "GONE"
+
+
+class EmailType:
+    SINGLE = "SINGLE"
+    MULTIPLE = "MULTIPLE"
+    NONE = "NONE"
 
 
 class TextSource:
@@ -246,12 +297,29 @@ def _process_attachment(
     if not row["ucn"]:
         return _finish(row, Outcome.NO_UCN, "No UCN in subject, body or document")
 
+    county = row["ucn"][:2]
+    if county not in SUPPORTED_COUNTY_CODES:
+        return _finish(
+            row,
+            Outcome.UCN_OTHER_COUNTY,
+            f"Case number starts {county}, not Polk. The pattern drops the last "
+            "letter of a three-letter division, so this number may be wrong.",
+        )
+
     if not result.is_classified:
+        # It has a case number, so it can go on the right case. What it is
+        # gets decided by a person inside STAC.
         if result.matched_phrase:
             reason = f"Only safety-net row {result.rule_row} matched, no Type or Subtype"
         else:
             reason = "No rule matched"
-        return _finish(row, Outcome.NO_MATCH, reason)
+        row["classified_type"] = PLS_RVW_TYPE
+        row["classified_subtype"] = PLS_RVW_SUBTYPE
+        return _finish(
+            row,
+            Outcome.PLS_RVW,
+            f"{reason}; entering under {PLS_RVW_TYPE}/{PLS_RVW_SUBTYPE} for review in STAC",
+        )
 
     notes = []
     if result.is_fuzzy:
@@ -397,11 +465,60 @@ def _process_message(
             row["ucn_document"] or "-",
         )
 
-    outcomes = {row["outcome"] for row in rows}
-    if len(rows) > 1 and Outcome.WOULD_ENTER in outcomes and len(outcomes) > 1:
-        logger.info("%s: mixed outcomes across %s attachments (would be PARTIAL)", received, len(rows))
-
     return rows
+
+
+# Outcomes that would be entered into STAC.
+ENTERABLE = frozenset({Outcome.WOULD_ENTER, Outcome.PLS_RVW})
+
+
+def _decide_email(rows: list[dict], email_number: int) -> str:
+    """Stamp the email-level decision onto every row of one email.
+
+    Returns the one-line summary that gets logged for the email.
+    """
+    outcomes = [row["outcome"] for row in rows]
+
+    if outcomes == [Outcome.GONE]:
+        email_type, decision, reason = EmailType.NONE, EmailDecision.GONE, "Left the folder before it was read"
+    elif outcomes == [Outcome.NO_FILES]:
+        email_type, decision, reason = EmailType.NONE, EmailDecision.MANUAL_REVIEW, "No file attachments"
+    else:
+        email_type = EmailType.SINGLE if len(rows) == 1 else EmailType.MULTIPLE
+        blocking = [row for row in rows if row["outcome"] not in ENTERABLE]
+        if not blocking:
+            decision = EmailDecision.UPLOAD
+            routed = sum(1 for row in rows if row["outcome"] == Outcome.PLS_RVW)
+            if len(rows) == 1:
+                reason = "Attachment would enter"
+                if routed:
+                    reason += f" under {PLS_RVW_TYPE}/{PLS_RVW_SUBTYPE}"
+            else:
+                reason = (
+                    "Both attachments would enter" if len(rows) == 2
+                    else f"All {len(rows)} attachments would enter"
+                )
+                if routed:
+                    reason += f" ({routed} under {PLS_RVW_TYPE}/{PLS_RVW_SUBTYPE})"
+        else:
+            decision = EmailDecision.MANUAL_REVIEW
+            counts = Counter(row["outcome"] for row in blocking)
+            held = ", ".join(f"{count} {outcome}" for outcome, count in counts.most_common())
+            if len(rows) == 1:
+                reason = f"Attachment is {rows[0]['outcome']}"
+            else:
+                reason = f"{len(rows) - len(blocking)} of {len(rows)} would enter; held back by {held}"
+
+    total = len(rows) if email_type != EmailType.NONE else 0
+    for position, row in enumerate(rows, start=1):
+        row["email_number"] = email_number
+        row["email_type"] = email_type
+        row["attachment"] = f"{position} of {total}" if total else ""
+        row["email_decision"] = decision
+        row["email_reason"] = reason
+
+    label = f"{email_type} ({total} attachment{'s' if total != 1 else ''})" if total else email_type
+    return f"Email {email_number}: {label} -> {decision}. {reason}"
 
 
 def _write_csv(rows: list[dict], path: Path) -> None:
@@ -473,17 +590,41 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 len(messages),
                 message.get("receivedDateTime"),
             )
-            rows.extend(_process_message(client, mailbox, message, rules, source_folder_id))
+            email_rows = _process_message(client, mailbox, message, rules, source_folder_id)
+            logger.info(_decide_email(email_rows, number))
+            rows.extend(email_rows)
     finally:
         # Written even on a crash, so a failure at message 40 still leaves
         # 39 messages of results to look at.
         _write_csv(rows, csv_path)
         logger.info("Wrote %s row(s) to %s", len(rows), csv_path)
 
+    # One entry per email: its first row carries the email-level fields.
+    emails = [row for row in rows if not row["attachment"] or row["attachment"].startswith("1 of ")]
+    email_counts = Counter((row["email_type"], row["email_decision"]) for row in emails)
+    logger.info("Emails: %s", len(emails))
+    for email_type in (EmailType.SINGLE, EmailType.MULTIPLE, EmailType.NONE):
+        for decision in (EmailDecision.UPLOAD, EmailDecision.MANUAL_REVIEW, EmailDecision.GONE):
+            count = email_counts.get((email_type, decision))
+            if count:
+                logger.info("  %-8s %-13s %s", email_type, decision, count)
+
     counts = Counter(row["outcome"] for row in rows)
-    logger.info("Outcomes across %s attachment row(s):", len(rows))
+    logger.info("Attachments: %s", len(rows))
     for outcome, count in counts.most_common():
         logger.info("  %-12s %s", outcome, count)
+
+    # The sheet only improves if someone looks at what fell through it.
+    # Nothing flags these in production, so say it here.
+    routed = counts.get(Outcome.PLS_RVW, 0)
+    if routed:
+        logger.info(
+            "%s attachment(s) matched no rule and would go in under %s/%s. "
+            "Check them in the CSV for titles worth a rule.",
+            routed,
+            PLS_RVW_TYPE,
+            PLS_RVW_SUBTYPE,
+        )
 
     return EXIT_OK
 
