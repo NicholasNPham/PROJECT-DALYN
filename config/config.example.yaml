@@ -35,8 +35,36 @@ max_emails_per_pass: 1
 # Production reads oldest first.
 newest_first: true
 
+# STAC. Point this at TEST STAC until a live run is deliberately approved.
+# is_test_instance is a second gate, the same idea as source_folder: DALYN
+# checks the url looks like a test instance and refuses to save anything if
+# this says true but the url does not. Set it to false only when a live run
+# is intended, and expect to change code as well.
+stac:
+  url: "https://stac-test.example.com"
+  username: "PASTE-STAC-USERNAME"
+  password: "PASTE-STAC-PASSWORD"
+  is_test_instance: true
+
+  # Set false to navigate and select the Type/Subtype but stop before the
+  # file is uploaded and Save is pressed. Nothing reaches STAC. Use this
+  # against the live instance; against test STAC leave it true so the whole
+  # path really runs.
+  save_enabled: true
+
+  # Seconds. Uploads are slow and the Kendo dialogs need a beat.
+  wait_timeout: 10
+  upload_timeout: 60
+
 # Paths, relative to the project root
 paths:
   logs: "logs"
   temp: "temp"
   excel: "Path/to/DALYN.xlsx"
+  tesseract: "Path/to/tesseract.exe"
+  # Export of STAC's active Type/Subtype pairs. Used to check the rules sheet
+  # before a run, so a bad label is caught here and not one document at a
+  # time inside STAC.
+  stac_types: "Path/to/Image_Types_SubTypes.xlsx"
+  # chromedriver.exe. Leave blank to let webdriver_manager fetch one.
+  chromedriver: ""
