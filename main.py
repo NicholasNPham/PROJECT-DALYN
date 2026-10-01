@@ -31,7 +31,7 @@ import classifier  # noqa: E402
 import ocr  # noqa: E402
 import ucn  # noqa: E402
 from config_loader import load_config  # noqa: E402
-from exceptions import DocumentProblem, GraphAuthError, SystemProblem  # noqa: E402
+from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProblem  # noqa: E402
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 
@@ -39,7 +39,8 @@ logger = get_logger("main")
 
 # Reviewer CSV, one row per attachment. The reviewer joins to STAC on ucn.
 # Nothing in these columns may come from subject or body text except the
-# UCNs themselves. matched_line is deliberately left out: title lines can
+# UCNs themselves. ucn_body and ucn_document can hold several UCNs,
+# space separated, when the text names more than one case. matched_line is deliberately left out: title lines can
 # carry party names, and diag.py shows the line when someone needs it.
 CSV_COLUMNS = (
     "mailbox",
@@ -82,8 +83,16 @@ class Outcome:
     Precedence, highest first. An attachment gets exactly one outcome:
         TOO_LARGE, NON_PDF, UNREADABLE   no text, nothing to classify
         NO_UCN                           nowhere to enter it, even if classified
+        UCN_CONFLICT                     the email and the document name different
+                                         cases, or a document with no email UCN
+                                         names several
         NO_MATCH                         no rule matched, or only a safety net did
         WOULD_ENTER                      classified and a UCN
+
+    GONE is email-level, like NO_FILES: the email left the source folder
+    after it was listed (moved, deleted or purged by a person), so it was
+    skipped without reading. Nobody needs to act on it; whoever moved it
+    has it.
 
     classified_type/subtype are filled whenever the classifier produced them,
     even if NO_UCN wins, so every readable PDF gets its classification checked.
@@ -91,11 +100,13 @@ class Outcome:
 
     WOULD_ENTER = "WOULD_ENTER"
     NO_UCN = "NO_UCN"
+    UCN_CONFLICT = "UCN_CONFLICT"
     NO_MATCH = "NO_MATCH"
     UNREADABLE = "UNREADABLE"
     NON_PDF = "NON_PDF"
     TOO_LARGE = "TOO_LARGE"
     NO_FILES = "NO_FILES"
+    GONE = "GONE"
 
 
 class TextSource:
@@ -125,11 +136,13 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
     OCR and keep that result. Safety-net hits are not retried, because the
     batch 10 numbers were measured without that.
 
-    The document UCN prefers the retry text but falls back to the embedded
-    text, since forced OCR reads only the first FORCE_OCR_PAGE_LIMIT pages.
+    Document UCNs are collected from both the embedded text and, if it ran,
+    the OCR retry, since forced OCR reads only the first FORCE_OCR_PAGE_LIMIT
+    pages and the embedded layer may have a corrupt caption.
 
     Returns:
-        (text, text_source, ClassificationResult, retried, document_ucn)
+        (text, text_source, ClassificationResult, retried, document_ucns)
+        document_ucns is every distinct UCN found, in order.
 
     Raises:
         DocumentProblem: If the first extraction cannot produce usable text.
@@ -137,20 +150,20 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
     """
     text, source = ocr.extract_text(pdf_bytes, filename)
     result = classifier.classify(rules, text)
-    document_ucn = ucn.find_ucn(text)
+    document_ucns = ucn.find_all(text)
 
     if result.matched_phrase or source != TextSource.EMBEDDED:
-        return text, source, result, False, document_ucn
+        return text, source, result, False, document_ucns
 
     try:
         text, source = ocr.extract_text(pdf_bytes, filename, force_ocr=True)
     except DocumentProblem as error:
         logger.info("%s: OCR retry failed, keeping embedded result (%s)", filename, error)
-        return text, source, result, True, document_ucn
+        return text, source, result, True, document_ucns
 
     result = classifier.classify(rules, text)
-    document_ucn = ucn.find_ucn(text) or document_ucn
-    return text, source, result, True, document_ucn
+    document_ucns = list(dict.fromkeys(ucn.find_all(text) + document_ucns))
+    return text, source, result, True, document_ucns
 
 
 def _finish(row: dict, outcome: str, reason: str = "") -> dict:
@@ -164,7 +177,7 @@ def _process_attachment(
     rules: list,
     base_row: dict,
     subject_ucn: str | None,
-    body_ucn: str | None,
+    body_ucns: list[str],
 ) -> dict:
     """Build one CSV row for one attachment. DocumentProblems become rows.
 
@@ -179,14 +192,13 @@ def _process_attachment(
     row["attachment_name"] = name
     row["size_bytes"] = size
     row["ucn_subject"] = subject_ucn or ""
-    row["ucn_body"] = body_ucn or ""
+    row["ucn_body"] = " ".join(body_ucns)
 
     # Filled now so early-exit rows (NON_PDF, TOO_LARGE, UNREADABLE) still
-    # carry a UCN for the reviewer to join on. The document UCN can only
-    # fill it later if subject and body both came up empty.
-    if subject_ucn or body_ucn:
-        row["ucn"] = subject_ucn or body_ucn
-        row["ucn_source"] = "subject" if subject_ucn else "body"
+    # carry a UCN for the reviewer to join on, when the email names one case.
+    email_choice, _ = _choose_ucn(subject_ucn, body_ucns, [])
+    if email_choice:
+        row["ucn"], row["ucn_source"] = email_choice
 
     if size > MAX_PDF_BYTES:
         return _finish(row, Outcome.TOO_LARGE, f"Over {MAX_PDF_BYTES // 1024 // 1024} MB")
@@ -205,7 +217,7 @@ def _process_attachment(
         return _finish(row, Outcome.NON_PDF, f"No PDF header (Graph says {content_type})")
 
     try:
-        text, source, result, retried, document_ucn = _read_and_classify(data, name, rules)
+        text, source, result, retried, document_ucns = _read_and_classify(data, name, rules)
     except DocumentProblem as error:
         return _finish(row, Outcome.UNREADABLE, f"Could not read the PDF: {error}")
 
@@ -220,25 +232,19 @@ def _process_attachment(
         row["classified_type"] = result.document_type
         row["classified_subtype"] = result.document_subtype
 
-    # Each source searched on its own so the reviewer can see disagreement.
-    # The chosen UCN follows ucn.find_ucn's precedence: subject, body, document.
-    row["ucn_document"] = document_ucn or ""
+    chosen, conflict = _choose_ucn(subject_ucn, body_ucns, document_ucns)
+    row["ucn_document"] = " ".join(document_ucns)
+    row["ucn_conflict"] = "YES" if conflict else ""
+    if chosen:
+        row["ucn"], row["ucn_source"] = chosen
+    else:
+        row["ucn"] = row["ucn_source"] = ""
 
-    for source_name, found in (
-        ("subject", subject_ucn),
-        ("body", body_ucn),
-        ("document", document_ucn),
-    ):
-        if found:
-            row["ucn"] = found
-            row["ucn_source"] = source_name
-            break
-
-    distinct = {found for found in (subject_ucn, body_ucn, document_ucn) if found}
-    row["ucn_conflict"] = "YES" if len(distinct) > 1 else ""
+    if conflict:
+        return _finish(row, Outcome.UCN_CONFLICT, conflict)
 
     if not row["ucn"]:
-        return _finish(row, Outcome.NO_UCN, "No UCN in subject, body preview or document")
+        return _finish(row, Outcome.NO_UCN, "No UCN in subject, body or document")
 
     if not result.is_classified:
         if result.matched_phrase:
@@ -250,51 +256,129 @@ def _process_attachment(
     notes = []
     if result.is_fuzzy:
         notes.append("Fuzzy match, check by hand")
-    if row["ucn_conflict"]:
-        notes.append("UCN sources disagree")
+    if row["ucn_source"] == "document":
+        notes.append("UCN from the document only")
     return _finish(row, Outcome.WOULD_ENTER, "; ".join(notes))
 
 
-def _process_message(client: GraphClient, mailbox: str, message: dict, rules: list) -> list[dict]:
-    """Return one CSV row per attachment, or a single NO_FILES row.
+def _choose_ucn(
+    subject_ucn: str | None, body_ucns: list[str], document_ucns: list[str]
+) -> tuple[tuple[str, str] | None, str]:
+    """Pick the UCN to enter under, or say why none can be trusted.
 
-    Subject and bodyPreview are read here only to pull UCNs out of them, and
+    Rules, agreed 1 Oct 2026:
+        email UCN and document agree        use it
+        email UCN, document has none        use the email UCN
+        no email UCN, document has one      use the document UCN
+        email UCN not in the document       conflict, Manual Review
+        no email UCN, document has several  conflict, Manual Review
+        nothing anywhere                    no UCN
+
+    "Email UCN" is the subject's. If the subject has none, the body's, but
+    only when the body names exactly one case: a full body often carries a
+    reply chain or forwarded history that mentions other cases, so a body
+    naming several is a conflict. When the subject has a UCN the body is
+    recorded but decides nothing, for the same reason.
+
+    A document that cites other cases still agrees if the email's UCN is
+    anywhere in it.
+
+    Returns:
+        ((ucn, source) or None, conflict reason or "").
+    """
+    if subject_ucn:
+        email_ucn, email_source = subject_ucn, "subject"
+    elif len(body_ucns) == 1:
+        email_ucn, email_source = body_ucns[0], "body"
+    elif len(body_ucns) > 1:
+        return None, (
+            f"No UCN in the subject and the body names {len(body_ucns)} cases: "
+            f"{', '.join(body_ucns)}"
+        )
+    else:
+        email_ucn, email_source = None, ""
+
+    if email_ucn:
+        if document_ucns and email_ucn not in document_ucns:
+            return None, (
+                f"Email names {email_ucn}, document names "
+                f"{', '.join(document_ucns)}"
+            )
+        return (email_ucn, email_source), ""
+
+    if len(document_ucns) > 1:
+        return None, (
+            f"No UCN on the email and the document names {len(document_ucns)} cases: "
+            f"{', '.join(document_ucns)}"
+        )
+
+    if document_ucns:
+        return (document_ucns[0], "document"), ""
+
+    return None, ""
+
+
+def _email_row(base_row: dict, subject_ucn: str | None, body_ucns: list[str]) -> dict:
+    """One row standing for a whole email, for NO_FILES and GONE."""
+    row = dict.fromkeys(CSV_COLUMNS, "")
+    row.update(base_row)
+    row["ucn_subject"] = subject_ucn or ""
+    row["ucn_body"] = " ".join(body_ucns)
+    chosen, _ = _choose_ucn(subject_ucn, body_ucns, [])
+    if chosen:
+        row["ucn"], row["ucn_source"] = chosen
+    return row
+
+
+def _process_message(
+    client: GraphClient, mailbox: str, message: dict, rules: list, source_folder_id: str
+) -> list[dict]:
+    """Return one CSV row per attachment, or a single NO_FILES or GONE row.
+
+    Subject and body are read here only to pull UCNs out of them, and
     are then dropped. They never reach the log or the CSV.
 
-    SystemProblem from Graph is not caught. That includes a 404 on a message
-    that vanished, until graph_client gets a GONE path; in a 50-message dry
-    run against Deleted Items that is rare enough to accept failing loudly.
+    The message is checked to still be in the source folder before anything
+    is read. Anyone with access to the mailbox can move or delete mail while
+    a pass is running; such a message is GONE and skipped, never an error.
+    Other Graph failures (SystemProblem) are not caught and stop the pass.
     """
     message_id = message["id"]
     received = message.get("receivedDateTime", "")
 
     subject_ucn = ucn.find_ucn("", subject=message.get("subject") or "")
-    body_ucn = ucn.find_ucn("", body=message.get("bodyPreview") or "")
+    # Full body as plain text (list_messages asks for it). bodyPreview, the
+    # first 255 characters, only as a fallback if the body did not come back.
+    body_text = (message.get("body") or {}).get("content") or message.get("bodyPreview") or ""
+    body_ucns = ucn.find_all(body_text)
 
     base_row = {"mailbox": mailbox, "message_id": message_id, "received_utc": received}
 
-    attachments = client.get_attachments(mailbox, message_id)
+    try:
+        current_folder = client.get_parent_folder_id(mailbox, message_id)
+        if current_folder != source_folder_id:
+            raise MessageGone("moved to another folder")
+        attachments = client.get_attachments(mailbox, message_id)
+    except MessageGone as error:
+        logger.info("%s: GONE, skipped (%s)", received, error)
+        row = _email_row(base_row, subject_ucn, body_ucns)
+        return [_finish(row, Outcome.GONE, f"Left the folder before DALYN read it: {error}")]
 
     if not attachments:
         # hasAttachments was true (list_messages filters on it) but nothing
         # usable came back. Usually an item attachment: a forwarded email
         # carrying the PDF, which get_attachments does not open yet.
-        row = dict.fromkeys(CSV_COLUMNS, "")
-        row.update(base_row)
-        row["ucn_subject"] = subject_ucn or ""
-        row["ucn_body"] = body_ucn or ""
-        row["ucn"] = subject_ucn or body_ucn or ""
-        row["ucn_source"] = "subject" if subject_ucn else ("body" if body_ucn else "")
+        row = _email_row(base_row, subject_ucn, body_ucns)
         logger.info(
             "%s: no file attachments, likely a forwarded item | subject ucn %s | body ucn %s",
             received,
             subject_ucn or "-",
-            body_ucn or "-",
+            " ".join(body_ucns) or "-",
         )
         return [_finish(row, Outcome.NO_FILES, "No file attachments; item attachments not read yet")]
 
     rows = [
-        _process_attachment(attachment, rules, base_row, subject_ucn, body_ucn)
+        _process_attachment(attachment, rules, base_row, subject_ucn, body_ucns)
         for attachment in attachments
     ]
 
@@ -375,6 +459,8 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     if limit is not None:
         messages = messages[:limit]
 
+    source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
+
     order = "newest first" if config["newest_first"] else "oldest first"
     logger.info("Dry run: %s message(s) from %s, %s", len(messages), mailbox, order)
 
@@ -387,7 +473,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 len(messages),
                 message.get("receivedDateTime"),
             )
-            rows.extend(_process_message(client, mailbox, message, rules))
+            rows.extend(_process_message(client, mailbox, message, rules, source_folder_id))
     finally:
         # Written even on a crash, so a failure at message 40 still leaves
         # 39 messages of results to look at.

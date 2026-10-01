@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import msal
 import requests
 
-from exceptions import GraphAuthError, SystemProblem
+from exceptions import GraphAuthError, MessageGone, SystemProblem
 from logger import get_logger
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -105,12 +105,18 @@ class GraphClient:
 
         return f"{GRAPH_BASE_URL}/users/{normalized}/{path}"
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _request(
+        self, method: str, url: str, gone_on_404: bool = False, **kwargs
+    ) -> requests.Response:
         """Make an authenticated Graph call, retrying on throttling and outages.
 
         Args:
             method: HTTP verb, e.g. "GET" or "PATCH".
             url: Full Graph URL, normally from _mailbox_url.
+            gone_on_404: Raise MessageGone instead of SystemProblem on 404.
+                Only for calls about one specific message. A 404 anywhere
+                else (a mailbox or folder that does not exist) is a real
+                configuration problem and must stay a SystemProblem.
             **kwargs: Passed through to requests, e.g. params, json.
 
         Returns:
@@ -118,12 +124,15 @@ class GraphClient:
 
         Raises:
             GraphAuthError: On 401, meaning the credential is bad or revoked.
+            MessageGone: On 404, only when gone_on_404 is set.
             SystemProblem: On any other non-success status, or if retries run out.
             requests.RequestException: On network failure, meaning try next pass.
         """
+        extra_headers = kwargs.pop("headers", {})
+
         for attempt in range(MAX_RETRIES):
             headers = {"Authorization": f"Bearer {self._get_token()}"}
-            headers.update(kwargs.pop("headers", {}))
+            headers.update(extra_headers)
 
             response = self._session.request(
                 method, url, headers=headers, timeout=30, **kwargs
@@ -134,6 +143,9 @@ class GraphClient:
 
             if response.status_code == 401:
                 raise GraphAuthError(f"Graph rejected the token: {response.text[:200]}")
+
+            if response.status_code == 404 and gone_on_404:
+                raise MessageGone("Graph returned 404 for this message")
 
             if response.status_code in (429, 503):
                 wait = self._retry_delay(response, attempt)
@@ -199,7 +211,8 @@ class GraphClient:
             newest_first: Sort order. True for dry runs, False for production.
 
         Returns:
-            Message dicts with id, receivedDateTime, and hasAttachments.
+            Message dicts with id, receivedDateTime, hasAttachments, subject,
+            bodyPreview, and body (the full body, as plain text).
             Possibly fewer than max_messages once attachment-less mail is dropped.
 
         Raises:
@@ -217,11 +230,18 @@ class GraphClient:
         params = {
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
-            "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview",
+            "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview,body",
             "$top": max_messages,
         }
 
-        response = self._request("GET", url, params=params)
+        # Plain text rather than HTML, so a UCN split across tags or
+        # entities still reads as one run of characters.
+        response = self._request(
+            "GET",
+            url,
+            params=params,
+            headers={"Prefer": 'outlook.body-content-type="text"'},
+        )
         messages = response.json().get("value", [])
 
         with_attachments = [m for m in messages if m.get("hasAttachments")]
@@ -235,6 +255,34 @@ class GraphClient:
         )
 
         return with_attachments
+
+    def get_folder_id(self, mailbox: str, folder: str) -> str:
+        """Return Graph's ID for a well-known folder such as deleteditems or inbox.
+
+        Fetched once per pass and compared against each message's
+        parentFolderId, to tell whether the message is still where DALYN
+        found it.
+
+        Raises:
+            SystemProblem: If the folder is not on the allowlist, or Graph fails.
+        """
+        url = self._mailbox_url(mailbox, f"mailFolders/{folder}")
+        return self._request("GET", url, params={"$select": "id"}).json()["id"]
+
+    def get_parent_folder_id(self, mailbox: str, message_id: str) -> str:
+        """Return the ID of the folder a message is in right now.
+
+        Checked immediately before processing, because the message ID alone
+        cannot be trusted to 404 after a move: in ImmutableId mode a moved
+        message keeps its ID and answers normally from its new folder.
+
+        Raises:
+            MessageGone: If the message no longer exists in the mailbox.
+            SystemProblem: If Graph fails for any other reason.
+        """
+        url = self._mailbox_url(mailbox, f"messages/{message_id}")
+        response = self._request("GET", url, gone_on_404=True, params={"$select": "parentFolderId"})
+        return response.json().get("parentFolderId", "")
 
     def get_attachments(self, mailbox: str, message_id: str) -> list[dict]:
         """Return file attachments for one message, with their bytes.
@@ -250,13 +298,15 @@ class GraphClient:
             Dicts with name, contentType, size, and contentBytes (base64 str).
 
         Raises:
+            MessageGone: If the message disappeared between the folder check
+                and this call.
             SystemProblem: If the mailbox is not on the allowlist, or if Graph
                 returns an unrecoverable error.
             GraphAuthError: If the credential is rejected.
         """
         url = self._mailbox_url(mailbox, f"messages/{message_id}/attachments")
 
-        response = self._request("GET", url)
+        response = self._request("GET", url, gone_on_404=True)
         attachments = response.json().get("value", [])
 
         files = [
