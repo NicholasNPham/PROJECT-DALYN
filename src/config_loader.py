@@ -18,10 +18,17 @@ REQUIRED_KEYS = (
     "days_back",
     "max_messages",
     "newest_first",
+    "stac",
     "paths",
 )
 REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id", "client_secret")
-PATH_KEYS = ("logs", "temp", "excel")
+REQUIRED_STAC_KEYS = ("url", "username", "password")
+PATH_KEYS = ("logs", "temp", "excel", "stac_types")
+
+# A url is treated as a test instance only if one of these appears in it.
+# Deliberately crude: the point is that a plain production url cannot be
+# left in place while is_test_instance still says true.
+TEST_URL_MARKERS = ("test", "uat", "stage", "staging", "dev")
 
 logger = get_logger(__name__)
 
@@ -61,11 +68,15 @@ def load_config(config_path: Path | None = None) -> dict:
     _validate(config, path)
     _resolve_paths(config)
 
+    stac = config["stac"]
     logger.info(
-        "Config loaded from %s (dry_run=%s, mailboxes=%s)",
+        "Config loaded from %s (dry_run=%s, mailboxes=%s, stac=%s, test=%s, save=%s)",
         path,
         config["dry_run"],
         len(config["mailboxes"]),
+        stac["url"],
+        stac.get("is_test_instance", True),
+        stac.get("save_enabled", False),
     )
 
     return config
@@ -110,6 +121,44 @@ def _validate(config: dict, path: Path) -> None:
     for key in ("dry_run", "newest_first"):
         if not isinstance(config[key], bool):
             raise SystemProblem(f"Config key '{key}' must be true or false.")
+
+    stac = config["stac"]
+    if not isinstance(stac, dict):
+        raise SystemProblem("Config key 'stac' must be a mapping.")
+
+    blank_stac = [key for key in REQUIRED_STAC_KEYS if not stac.get(key)]
+    if blank_stac:
+        raise SystemProblem(
+            f"Config at {path} has empty stac settings: {', '.join(blank_stac)}"
+        )
+
+    url = str(stac["url"]).strip()
+    if not url.lower().startswith("https://"):
+        raise SystemProblem(f"Config 'stac.url' must be https, got {url!r}.")
+
+    for key in ("is_test_instance", "save_enabled"):
+        if key in stac and not isinstance(stac[key], bool):
+            raise SystemProblem(f"Config key 'stac.{key}' must be true or false.")
+
+    # Refuse the combination that does the damage: a url that is clearly not
+    # a test instance, while the config still claims it is. Someone pasting
+    # the live url into a test config should be stopped here, not after the
+    # first document is filed on a real case.
+    if stac.get("is_test_instance", True) and not any(
+        marker in url.lower() for marker in TEST_URL_MARKERS
+    ):
+        raise SystemProblem(
+            f"Config says stac.is_test_instance is true, but {url!r} does not look "
+            f"like a test instance (expected one of {', '.join(TEST_URL_MARKERS)} in "
+            "the address). Fix the url, or set is_test_instance to false on purpose."
+        )
+
+    for key in ("wait_timeout", "upload_timeout"):
+        value = stac.get(key)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise SystemProblem(f"Config key 'stac.{key}' must be a positive integer.")
 
     paths = config["paths"]
     if not isinstance(paths, dict):
