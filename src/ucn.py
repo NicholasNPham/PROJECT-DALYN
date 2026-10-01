@@ -61,6 +61,16 @@ def find_ucn(document_text: str, body: str = "", subject: str = "") -> str | Non
 
     return None
 
+def find_all(text: str) -> list[str]:
+    """Return every distinct UCN in the text, in order of first appearance.
+
+    Used to compare a document against the email: a document that cites
+    other cases still agrees with the email if the email's UCN is anywhere
+    in it.
+    """
+    return list(dict.fromkeys(_find_all(text))) if text else []
+
+
 def _find_all(text: str) -> list[str]:
     """Return every UCN in the text, in order of appearance, normalized.
 
