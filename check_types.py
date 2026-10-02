@@ -74,6 +74,47 @@ def load_stac_pairs(path: Path) -> dict[tuple[str, str], tuple[str, bool]]:
     return pairs
 
 
+def check_review_pair(
+    config: dict,
+    pairs: dict,
+    active: set,
+    flat_active: list[str],
+) -> bool:
+    """Check the pair unclassified attachments are filed under. True if broken.
+
+    This pair does not come from the rules sheet, so the loop over rules never
+    saw it. That gap is exactly how a run reached STAC and failed on every
+    unclassified document with "no row for PLS/RVW": the rules all checked out
+    and the one hardcoded pair was never looked at.
+    """
+    stac = config.get("stac", {})
+    key = (
+        str(stac.get("review_type", "PLS")).strip().upper(),
+        str(stac.get("review_subtype", "RVW")).strip().upper(),
+    )
+    label = f"{key[0]}/{key[1]}"
+
+    if key in active:
+        print(f"Unclassified attachments file to {label}, which is active in STAC.\n")
+        return False
+
+    if key in pairs:
+        print(f"PROBLEM: unclassified attachments file to {label}, INACTIVE in STAC.")
+    else:
+        print(f"PROBLEM: unclassified attachments file to {label}, NOT in STAC.")
+        for suggestion in get_close_matches(label, flat_active, n=SUGGESTIONS, cutoff=0.3):
+            document_type, subtype = suggestion.split("/", 1)
+            description = pairs[(document_type, subtype)][0]
+            print(f"         try {suggestion}{'  ' + description if description else ''}")
+
+    print(
+        "         Set stac.review_type and stac.review_subtype in config.yaml to a\n"
+        "         pair this instance has. Every attachment that matches no rule\n"
+        "         fails in STAC until then.\n"
+    )
+    return True
+
+
 def main() -> int:
     try:
         config = load_config()
@@ -120,9 +161,14 @@ def main() -> int:
         suggestions = get_close_matches(f"{key[0]}/{key[1]}", flat_active, n=SUGGESTIONS, cutoff=0.5)
         problems.append((rule, key, "NOT in STAC", suggestions))
 
-    if not problems:
+    review_problem = check_review_pair(config, pairs, active, flat_active)
+
+    if not problems and not review_problem:
         print("Every rule files to an active STAC Type/Subtype pair.\n")
         return 0
+
+    if not problems:
+        return 1
 
     print(f"{len(problems)} of {len(rules)} rules point at a pair STAC will not accept:\n")
     for rule, key, what, suggestions in problems:

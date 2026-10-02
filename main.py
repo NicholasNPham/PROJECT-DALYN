@@ -16,6 +16,7 @@ import argparse
 import base64
 import binascii
 import csv
+import shutil
 import sys
 import time
 from collections import Counter
@@ -34,6 +35,7 @@ from config_loader import load_config  # noqa: E402
 from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProblem  # noqa: E402
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
+from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
 
@@ -69,6 +71,8 @@ CSV_COLUMNS = (
     "rule_row",
     "outcome",
     "reason",
+    "stac_result",
+    "stac_reason",
 )
 
 # A real PDF starts with %PDF-. The spec tolerates junk before the header,
@@ -89,12 +93,30 @@ PDF_HEADER_WINDOW = 1024
 SUPPORTED_COUNTY_CODES = frozenset({"53"})
 
 # Where any attachment goes that has a usable case number but matched no
-# rule. Confirmed by Nick on 1 Oct 2026 as a real STAC Type/Subtype pair.
-# Cover letters and similar one-off correspondence vary too much to write
-# rules for, so they are entered on the case and sorted out inside STAC
+# rule. Cover letters and similar one-off correspondence vary too much to
+# write rules for, so they are entered on the case and sorted out inside STAC
 # rather than handed back to a person in Outlook.
-PLS_RVW_TYPE = "PLS"
-PLS_RVW_SUBTYPE = "RVW"
+#
+# Both halves are the string "PLS RVW", read off STAC's matrix dialog on
+# 1 Oct 2026. It is one Type whose Subtype has the same name, not Type PLS
+# with Subtype RVW. _apply_review_pair can override both from config, and
+# config_loader will not let an override reach live STAC.
+PLS_RVW_TYPE = "PLS RVW"
+PLS_RVW_SUBTYPE = "PLS RVW"
+
+
+def _apply_review_pair(config: dict) -> None:
+    """Point the no-rule Type/Subtype at whatever this instance actually has.
+
+    Module-level rather than threaded through every caller on purpose. Five
+    functions reference this pair for one line of text each, and passing
+    config into all of them to carry two strings is a worse trade than two
+    globals written once before any message is read.
+    """
+    global PLS_RVW_TYPE, PLS_RVW_SUBTYPE
+    stac = config.get("stac", {})
+    PLS_RVW_TYPE = stac.get("review_type") or PLS_RVW_TYPE
+    PLS_RVW_SUBTYPE = stac.get("review_subtype") or PLS_RVW_SUBTYPE
 
 # Anything bigger is skipped rather than OCR'd. Arbitrary; revisit once the
 # dry run shows what real filings weigh.
@@ -160,6 +182,21 @@ class EmailType:
     NONE = "NONE"
 
 
+class StacResult:
+    """What STAC did with one attachment.
+
+    ENTERED and REHEARSED both mean everything worked. The difference is only
+    whether stac.save_enabled was on.
+    """
+
+    ENTERED = "ENTERED"
+    REACHED_SAVE = "REACHED_SAVE"
+    REHEARSED = "REHEARSED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+    NOT_ATTEMPTED = ""
+
+
 class TextSource:
     EMBEDDED = "embedded"
     OCR = "ocr"
@@ -168,6 +205,11 @@ class TextSource:
 EXIT_OK = 0
 EXIT_SYSTEM_PROBLEM = 1
 EXIT_CONFIG_PROBLEM = 2
+
+# How many emails in a row may fail inside STAC before the pass gives up.
+# One email with an odd page should not end a run; STAC being down should.
+# Reset by any email that gets through.
+MAX_CONSECUTIVE_STAC_FAILURES = 5
 
 # --watch: stop after this many passes in a row fail with a SystemProblem.
 # One Graph hiccup should not end a watch; three in a row means something
@@ -271,6 +313,11 @@ def _process_attachment(
         text, source, result, retried, document_ucns = _read_and_classify(data, name, rules)
     except DocumentProblem as error:
         return _finish(row, Outcome.UNREADABLE, f"Could not read the PDF: {error}")
+
+    # Carried out of band so STAC can write the file to disk later. Stripped
+    # before the CSV is written, since these are megabytes of PDF.
+    row["_bytes"] = data
+    row["_text"] = text
 
     row["text_source"] = source
     row["ocr_retry"] = "YES" if retried else ""
@@ -472,11 +519,24 @@ def _process_message(
 ENTERABLE = frozenset({Outcome.WOULD_ENTER, Outcome.PLS_RVW})
 
 
-def _decide_email(rows: list[dict], email_number: int) -> str:
+def _decide_email(rows: list[dict], email_number: int, keep_decision: bool = False) -> str:
     """Stamp the email-level decision onto every row of one email.
 
     Returns the one-line summary that gets logged for the email.
     """
+    if keep_decision:
+        # STAC has already had its say and may have downgraded the email.
+        # Re-deciding from the attachment outcomes would undo that.
+        decision = rows[0]["email_decision"]
+        reason = rows[0]["email_reason"]
+        total = len(rows) if rows[0]["attachment"] else 0
+        label = (
+            f"{rows[0]['email_type']} ({total} attachment{'s' if total != 1 else ''})"
+            if total
+            else rows[0]["email_type"]
+        )
+        return f"Email {email_number}: {label} -> {decision}. {reason}"
+
     outcomes = [row["outcome"] for row in rows]
 
     if outcomes == [Outcome.GONE]:
@@ -521,10 +581,104 @@ def _decide_email(rows: list[dict], email_number: int) -> str:
     return f"Email {email_number}: {label} -> {decision}. {reason}"
 
 
+def _stac_documents(rows: list[dict], work_dir: Path, email_number: int) -> list:
+    """Write this email's enterable attachments to disk for Selenium.
+
+    Selenium uploads from a file path, so the bytes held in memory have to
+    land somewhere first. Files are named with the email number so two
+    attachments called Order.pdf on different emails cannot collide.
+
+    Returns:
+        (path, document_type, subtype) per attachment, in email order.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    documents = []
+
+    for position, row in enumerate(rows, start=1):
+        if row["outcome"] not in ENTERABLE:
+            continue
+        target = work_dir / f"{email_number:04d}_{position}_{row['attachment_name'].strip()}"
+        target.write_bytes(row["_bytes"])
+        documents.append((target, row["classified_type"], row["classified_subtype"]))
+
+    return documents
+
+
+def _enter_in_stac(runner, rows: list[dict], work_dir: Path, email_number: int) -> bool:
+    """Put one email's documents into STAC and record the result on each row.
+
+    Only called for an email already decided UPLOAD, so every enterable
+    attachment goes or none does.
+
+    A STAC failure is recorded against this email and the pass carries on.
+    One email with a page that will not settle should not end a run, and
+    stopping would leave the rest of the Inbox untouched with no record of
+    why. The caller counts consecutive failures and stops when STAC is
+    plainly down rather than merely awkward.
+
+    Returns:
+        True when the email got through, False when it did not.
+    """
+    documents = _stac_documents(rows, work_dir, email_number)
+    if not documents:
+        return True
+
+    enterable = [row for row in rows if row["outcome"] in ENTERABLE]
+    ucn_value = enterable[0]["ucn"]
+    # Any one document's text will do for the defendant check; the longest is
+    # the most likely to carry a readable caption.
+    document_text = max((row.get("_text") or "" for row in enterable), key=len)
+
+    try:
+        runner.enter_email(ucn_value, documents, document_text)
+    except SaveMayHaveHappened as error:
+        _mark_stac(enterable, StacResult.UNKNOWN, str(error))
+        logger.error("Email %s: %s", email_number, error)
+        return False
+    except PartiallyEntered as error:
+        _mark_stac(enterable, StacResult.FAILED, str(error))
+        logger.error("Email %s: %s", email_number, error)
+        return False
+    except DocumentProblem as error:
+        _mark_stac(enterable, StacResult.FAILED, str(error))
+        logger.info("Email %s: not filed, %s", email_number, error)
+        # The document's own problem, not STAC's. It does not count towards
+        # giving up, because the next email may be perfectly fine.
+        return True
+    except SystemProblem as error:
+        _mark_stac(enterable, StacResult.FAILED, f"STAC failed: {error}")
+        logger.error("Email %s: STAC failed, moving on. %s", email_number, error)
+        return False
+    else:
+        session = runner.session
+        if session.save_enabled:
+            done = StacResult.ENTERED
+        elif session.upload_enabled:
+            done = StacResult.REACHED_SAVE
+        else:
+            done = StacResult.REHEARSED
+        _mark_stac(enterable, done, "")
+        return True
+
+
+def _mark_stac(rows: list[dict], result: str, reason: str) -> None:
+    """Record the STAC outcome on every row, and downgrade the email if it failed."""
+    for row in rows:
+        row["stac_result"] = result
+        row["stac_reason"] = reason
+
+    if result in (StacResult.FAILED, StacResult.UNKNOWN):
+        for row in rows:
+            row["email_decision"] = EmailDecision.MANUAL_REVIEW
+            row["email_reason"] = reason
+
+
 def _write_csv(rows: list[dict], path: Path) -> None:
     # utf-8-sig so Excel opens it without mangling anything non-ASCII.
+    # extrasaction drops the _bytes and _text keys, which are megabytes of
+    # PDF and the document's full text, neither of which belongs in a CSV.
     with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -581,19 +735,46 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     order = "newest first" if config["newest_first"] else "oldest first"
     logger.info("Dry run: %s message(s) from %s, %s", len(messages), mailbox, order)
 
+    work_dir = config["paths"]["temp"] / f"stac_{stamp}"
+
     rows: list[dict] = []
+    stac_failures = 0
     try:
-        for number, message in enumerate(messages, start=1):
-            logger.info(
-                "Message %s of %s, received %s",
-                number,
-                len(messages),
-                message.get("receivedDateTime"),
-            )
-            email_rows = _process_message(client, mailbox, message, rules, source_folder_id)
-            logger.info(_decide_email(email_rows, number))
-            rows.extend(email_rows)
+        # One browser for the whole pass. Opened before the first message so a
+        # bad password or an unreachable STAC stops the run immediately rather
+        # than after fifty documents have been OCR'd for nothing.
+        with StacRunner(config) as runner:
+            for number, message in enumerate(messages, start=1):
+                logger.info(
+                    "Message %s of %s, received %s",
+                    number,
+                    len(messages),
+                    message.get("receivedDateTime"),
+                )
+                email_rows = _process_message(client, mailbox, message, rules, source_folder_id)
+                summary = _decide_email(email_rows, number)
+
+                if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
+                    if _enter_in_stac(runner, email_rows, work_dir, number):
+                        stac_failures = 0
+                    else:
+                        stac_failures += 1
+                    # The STAC result can turn an UPLOAD into a Manual Review,
+                    # so the summary is re-read afterwards rather than before.
+                    summary = _decide_email(email_rows, number, keep_decision=True)
+
+                logger.info(summary)
+                rows.extend(email_rows)
+
+                if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
+                    raise SystemProblem(
+                        f"{stac_failures} emails in a row failed inside STAC. Stopping "
+                        "rather than working through the rest of the mailbox against "
+                        "something that is not answering."
+                    )
     finally:
+        # Real case documents. Gone whether the pass finished or crashed.
+        shutil.rmtree(work_dir, ignore_errors=True)
         # Written even on a crash, so a failure at message 40 still leaves
         # 39 messages of results to look at.
         _write_csv(rows, csv_path)
@@ -613,6 +794,12 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     logger.info("Attachments: %s", len(rows))
     for outcome, count in counts.most_common():
         logger.info("  %-12s %s", outcome, count)
+
+    stac_counts = Counter(row["stac_result"] for row in rows if row["stac_result"])
+    if stac_counts:
+        logger.info("STAC:")
+        for result, count in stac_counts.most_common():
+            logger.info("  %-12s %s", result, count)
 
     # The sheet only improves if someone looks at what fell through it.
     # Nothing flags these in production, so say it here.
@@ -695,6 +882,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG_PROBLEM
 
     setup_logging(config["paths"]["logs"])
+    _apply_review_pair(config)
+
+    if (PLS_RVW_TYPE, PLS_RVW_SUBTYPE) != ("PLS RVW", "PLS RVW"):
+        logger.warning(
+            "Unclassified attachments will be filed under %s/%s, not "
+            "'PLS RVW'/'PLS RVW'. This is a stand-in, set in config.",
+            PLS_RVW_TYPE,
+            PLS_RVW_SUBTYPE,
+        )
 
     if not config["dry_run"]:
         logger.error(
