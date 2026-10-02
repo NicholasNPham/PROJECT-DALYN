@@ -46,22 +46,65 @@ stac:
   password: "PASTE-STAC-PASSWORD"
   is_test_instance: true
 
-  # Set false to navigate and select the Type/Subtype but stop before the
-  # file is uploaded and Save is pressed. Nothing reaches STAC. Use this
-  # against the live instance; against test STAC leave it true so the whole
-  # path really runs.
-  save_enabled: true
+  # Two switches, three stages. Work down the list.
+  #
+  #   upload_enabled: false, save_enabled: false
+  #       Finds the case, checks the defendant, picks the Type/Subtype,
+  #       then stops. Nothing is sent to STAC at all. Start here.
+  #
+  #   upload_enabled: true, save_enabled: false
+  #       Also uploads the files and checks the Save button is there and
+  #       ready, then refuses to press it. The files DO reach STAC's
+  #       server, so only do this against test STAC.
+  #
+  #   upload_enabled: true, save_enabled: true
+  #       Presses Save. Documents go onto cases.
+  #
+  # save_enabled without upload_enabled is refused: there would be nothing
+  # to save.
+  upload_enabled: false
+  save_enabled: false
+
+  # Attempts per email. A wedged Kendo dialog does not recover from another
+  # click, so a retry closes Chrome and signs in again. Never applies once
+  # Save has been pressed: that case goes to a person instead, because a
+  # retry could file the same document twice. 1 disables retrying.
+  max_attempts: 2
 
   # Seconds. Uploads are slow and the Kendo dialogs need a beat.
   wait_timeout: 10
   upload_timeout: 60
+
+  # true closes Chrome and signs in again after every upload box, the way
+  # PCSO911 does. Slower, roughly ten seconds a document, but every document
+  # starts from a clean page and none of STAC's leftover state can carry
+  # over. false reuses one browser for the whole pass, which is much faster
+  # and relies on the page being left tidy.
+  fresh_browser: true
+
+  # Seconds to pause after each step, so a person can watch what the browser
+  # is doing. 0 for normal running. 1 makes a pass roughly ten seconds per
+  # document slower, which is fine while testing and not fine in production.
+  action_pause: 0
+
+  # Where an attachment goes when it has a good case number but matched no
+  # rule: on the right case, under a code a person reviews inside STAC.
+  #
+  # Live STAC has PLS/RVW for this, and these two may be left out entirely to
+  # get it. Test STAC has no PLS/RVW, so point it at something that exists
+  # there. TEST/TEST is the obvious choice: it is real in test STAC and
+  # unmistakable if it ever showed up anywhere else.
+  #
+  # Anything other than PLS/RVW is refused when is_test_instance is false. A
+  # stand-in code on live would file real filings where nobody looks.
+  review_type: "TEST"
+  review_subtype: "TEST"
 
 # Paths, relative to the project root
 paths:
   logs: "logs"
   temp: "temp"
   excel: "Path/to/DALYN.xlsx"
-  tesseract: "Path/to/tesseract.exe"
   # Export of STAC's active Type/Subtype pairs. Used to check the rules sheet
   # before a run, so a bad label is caught here and not one document at a
   # time inside STAC.

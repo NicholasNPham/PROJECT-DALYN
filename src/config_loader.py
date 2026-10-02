@@ -30,6 +30,14 @@ PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 # left in place while is_test_instance still says true.
 TEST_URL_MARKERS = ("test", "uat", "stage", "staging", "dev")
 
+# Where an attachment goes when it has a usable case number but matched no
+# rule. Both halves are the same string, read off STAC's own matrix dialog on
+# 1 Oct 2026: Type "PLS RVW" (IMAGE NEEDS TO BE REVIEWED), Subtype "PLS RVW"
+# (Please Review.). Not Type PLS with Subtype RVW, which is what it was
+# modelled as until a run printed the real rows.
+LIVE_REVIEW_TYPE = "PLS RVW"
+LIVE_REVIEW_SUBTYPE = "PLS RVW"
+
 logger = get_logger(__name__)
 
 
@@ -70,12 +78,13 @@ def load_config(config_path: Path | None = None) -> dict:
 
     stac = config["stac"]
     logger.info(
-        "Config loaded from %s (dry_run=%s, mailboxes=%s, stac=%s, test=%s, save=%s)",
+        "Config loaded from %s (dry_run=%s, mailboxes=%s, stac=%s, test=%s, upload=%s, save=%s)",
         path,
         config["dry_run"],
         len(config["mailboxes"]),
         stac["url"],
         stac.get("is_test_instance", True),
+        stac.get("upload_enabled", False),
         stac.get("save_enabled", False),
     )
 
@@ -132,11 +141,18 @@ def _validate(config: dict, path: Path) -> None:
             f"Config at {path} has empty stac settings: {', '.join(blank_stac)}"
         )
 
+    if stac.get("save_enabled") and not stac.get("upload_enabled"):
+        raise SystemProblem(
+            "Config has stac.save_enabled true but stac.upload_enabled false. "
+            "There would be nothing uploaded to save. Set upload_enabled true, "
+            "or save_enabled false."
+        )
+
     url = str(stac["url"]).strip()
     if not url.lower().startswith("https://"):
         raise SystemProblem(f"Config 'stac.url' must be https, got {url!r}.")
 
-    for key in ("is_test_instance", "save_enabled"):
+    for key in ("is_test_instance", "upload_enabled", "save_enabled", "fresh_browser"):
         if key in stac and not isinstance(stac[key], bool):
             raise SystemProblem(f"Config key 'stac.{key}' must be true or false.")
 
@@ -153,12 +169,18 @@ def _validate(config: dict, path: Path) -> None:
             "the address). Fix the url, or set is_test_instance to false on purpose."
         )
 
-    for key in ("wait_timeout", "upload_timeout"):
+    for key in ("wait_timeout", "upload_timeout", "max_attempts"):
         value = stac.get(key)
         if value is not None and (
             not isinstance(value, int) or isinstance(value, bool) or value < 1
         ):
             raise SystemProblem(f"Config key 'stac.{key}' must be a positive integer.")
+
+    pause = stac.get("action_pause")
+    if pause is not None and (isinstance(pause, bool) or not isinstance(pause, (int, float)) or pause < 0):
+        raise SystemProblem("Config key 'stac.action_pause' must be 0 or more seconds.")
+
+    _validate_review_pair(stac)
 
     paths = config["paths"]
     if not isinstance(paths, dict):
@@ -169,12 +191,70 @@ def _validate(config: dict, path: Path) -> None:
         raise SystemProblem(f"Config 'paths' is missing: {', '.join(missing_paths)}")
 
 
+def _validate_review_pair(stac: dict) -> None:
+    """Check the Type/Subtype that unclassified attachments are filed under.
+
+    Live STAC has PLS/RVW. Test STAC does not, which is why this is config at
+    all. The one rule worth enforcing: anything other than PLS/RVW is a
+    stand-in for testing, and a stand-in on a live instance would quietly file
+    real filings under a made-up code that nobody reviews. So a different pair
+    is only allowed while is_test_instance is true.
+
+    Raises:
+        SystemProblem: If only one half of the pair is set, if either is not a
+            string, or if a stand-in pair is configured against live STAC.
+    """
+    document_type = stac.get("review_type")
+    subtype = stac.get("review_subtype")
+
+    if document_type is None and subtype is None:
+        stac["review_type"] = LIVE_REVIEW_TYPE
+        stac["review_subtype"] = LIVE_REVIEW_SUBTYPE
+        return
+
+    # Half a pair files everything under the wrong code, so it is an error
+    # rather than something to fill in with a default.
+    if document_type is None or subtype is None:
+        raise SystemProblem(
+            "Config has only one of stac.review_type and stac.review_subtype. "
+            "Set both, or neither to use "
+            f"{LIVE_REVIEW_TYPE}/{LIVE_REVIEW_SUBTYPE}."
+        )
+
+    for key, value in (("review_type", document_type), ("review_subtype", subtype)):
+        if not isinstance(value, str) or not value.strip():
+            raise SystemProblem(f"Config key 'stac.{key}' must be a non-empty string.")
+
+    document_type = document_type.strip().upper()
+    subtype = subtype.strip().upper()
+    stac["review_type"] = document_type
+    stac["review_subtype"] = subtype
+
+    is_live = not stac.get("is_test_instance", True)
+    is_stand_in = (document_type, subtype) != (LIVE_REVIEW_TYPE, LIVE_REVIEW_SUBTYPE)
+
+    if is_live and is_stand_in:
+        raise SystemProblem(
+            "Config sets stac.review_type/stac.review_subtype to "
+            f"{document_type}/{subtype} on a live instance. Only "
+            f"{LIVE_REVIEW_TYPE}/{LIVE_REVIEW_SUBTYPE} may be used against live "
+            "STAC; a stand-in code would file real documents where nobody looks "
+            "for them."
+        )
+
+
 def _resolve_paths(config: dict) -> None:
     """Turn `paths` values into absolute Paths, anchored at the project root."""
     resolved = {}
 
     for key, value in config["paths"].items():
-        candidate = Path(value)
+        # A blank optional path means "not set". Without this it becomes
+        # Path(""), which resolves to the project root and then looks like a
+        # real setting to everything downstream.
+        if value is None or not str(value).strip():
+            resolved[key] = None
+            continue
+        candidate = Path(str(value).strip())
         resolved[key] = candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
 
     config["paths"] = resolved
