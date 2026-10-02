@@ -11,25 +11,35 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+from config_loader import mailbox_addresses
 from graph_client import GraphClient
 
 with open("config/config.yaml", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
+
+# Raw yaml, so there is no enabled_mailboxes key: that one is added by
+# load_config, which this script does not call. Enabled only, since this pulls
+# real case documents out of a live mailbox.
+MAILBOXES = mailbox_addresses(config)
+if not MAILBOXES:
+    sys.exit("No enabled mailboxes in config.yaml.")
 
 graph = config["graph"]
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=config["mailboxes"],
+    allowed_mailboxes=MAILBOXES,
 )
 
-mailbox = config["mailboxes"][0]
+mailbox = MAILBOXES[0]
 out = Path("temp/sample10")
 
 if out.exists():
     sys.exit(f"{out} already exists. Move or delete it first.")
 out.mkdir(parents=True)
+
+print(f"Reading {mailbox}")
 
 messages = client.list_messages(
     mailbox=mailbox,

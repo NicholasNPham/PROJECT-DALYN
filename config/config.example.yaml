@@ -7,10 +7,18 @@ graph:
   client_secret: "PASTE-SECRET-VALUE"   # the secret Value, not the Secret ID
 
 # Mailboxes DALYN is permitted to touch. Full SMTP addresses, not aliases.
-# This list is the allowlist enforced in graph_client.py. Nothing outside it
-# can be reached, so add addresses here only when access is actually approved.
+#
+# enabled is required on every entry and the enabled ones become the allowlist
+# enforced in graph_client.py. A disabled mailbox is not reachable at all, not
+# merely skipped, so this is where a mailbox is genuinely held back until its
+# access is approved. Enable one at a time.
 mailboxes:
-  - "mailbox@example.com"
+  - address: "mailbox@example.com"
+    enabled: false
+  - address: "mailbox@example.com"
+    enabled: true
+  - address: "mailbox@example.com"
+    enabled: false
 
 # Which folder to read. Also hardcoded in graph_client.ALLOWED_FOLDERS as a
 # second gate, so changing this alone will not move DALYN to the Inbox.

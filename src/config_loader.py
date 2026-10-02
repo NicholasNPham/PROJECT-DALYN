@@ -24,6 +24,7 @@ REQUIRED_KEYS = (
 REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id", "client_secret")
 REQUIRED_STAC_KEYS = ("url", "username", "password")
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
+MAILBOX_KEYS = ("address", "enabled")
 
 # A url is treated as a test instance only if one of these appears in it.
 # Deliberately crude: the point is that a plain production url cannot be
@@ -78,10 +79,13 @@ def load_config(config_path: Path | None = None) -> dict:
 
     stac = config["stac"]
     logger.info(
-        "Config loaded from %s (dry_run=%s, mailboxes=%s, stac=%s, test=%s, upload=%s, save=%s)",
+        "Config loaded from %s (dry_run=%s, mailboxes=%s of %s enabled: %s, "
+        "stac=%s, test=%s, upload=%s, save=%s)",
         path,
         config["dry_run"],
+        len(config["enabled_mailboxes"]),
         len(config["mailboxes"]),
+        ", ".join(config["enabled_mailboxes"]),
         stac["url"],
         stac.get("is_test_instance", True),
         stac.get("upload_enabled", False),
@@ -111,16 +115,7 @@ def _validate(config: dict, path: Path) -> None:
             f"Config at {path} has empty graph credentials: {', '.join(blank)}"
         )
 
-    mailboxes = config["mailboxes"]
-    if not isinstance(mailboxes, list) or not mailboxes:
-        raise SystemProblem("Config key 'mailboxes' must be a non-empty list.")
-
-    for mailbox in mailboxes:
-        if not isinstance(mailbox, str) or "@" not in mailbox:
-            raise SystemProblem(
-                f"Not a valid SMTP address in 'mailboxes': {mailbox!r}. "
-                "Aliases and display names will not work."
-            )
+    _validate_mailboxes(config, path)
 
     for key in ("days_back", "max_messages"):
         value = config[key]
@@ -191,6 +186,82 @@ def _validate(config: dict, path: Path) -> None:
         raise SystemProblem(f"Config 'paths' is missing: {', '.join(missing_paths)}")
 
 
+def _validate_mailboxes(config: dict, path: Path) -> None:
+    """Normalize the mailbox list and derive the allowlist from the enabled ones.
+
+    Each entry is a mapping with an `address` and an `enabled` flag, so a
+    mailbox can sit in the file while switched off. Only the enabled addresses
+    are handed to GraphClient, which makes a disabled mailbox unreachable
+    rather than merely unvisited. That distinction carries weight while the app
+    registration still holds tenant-wide mail access: this list is the only
+    thing confining it, so "not in the loop" is not good enough for juvenile.
+
+    Adds `enabled_mailboxes` to the config: the addresses to read, in file
+    order.
+
+    Raises:
+        SystemProblem: If the list is empty, an entry is the wrong shape, an
+            address is duplicated, or nothing is enabled.
+    """
+    mailboxes = config["mailboxes"]
+    if not isinstance(mailboxes, list) or not mailboxes:
+        raise SystemProblem("Config key 'mailboxes' must be a non-empty list.")
+
+    normalized: list[dict] = []
+    seen: set[str] = set()
+
+    for index, entry in enumerate(mailboxes, start=1):
+        if not isinstance(entry, dict):
+            raise SystemProblem(
+                f"Config 'mailboxes' entry {index} is {entry!r}. Each entry must be "
+                "a mapping with 'address' and 'enabled'. See config.example.yaml."
+            )
+
+        unknown = sorted(set(entry) - set(MAILBOX_KEYS))
+        if unknown:
+            raise SystemProblem(
+                f"Config 'mailboxes' entry {index} has unexpected keys: "
+                f"{', '.join(unknown)}. Only 'address' and 'enabled' are read, so a "
+                "typo here would be a setting that silently does nothing."
+            )
+
+        address = entry.get("address")
+        if not isinstance(address, str) or "@" not in address:
+            raise SystemProblem(
+                f"Config 'mailboxes' entry {index} has address {address!r}. A full "
+                "SMTP address is required; aliases and display names will not work."
+            )
+
+        enabled = entry.get("enabled")
+        if not isinstance(enabled, bool):
+            raise SystemProblem(
+                f"Config 'mailboxes' entry {index} ({address}) must set 'enabled' to "
+                "true or false. It has no default on purpose: a mailbox that is "
+                "neither clearly on nor clearly off is the one that gets read by "
+                "accident."
+            )
+
+        address = address.strip().lower()
+        if address in seen:
+            raise SystemProblem(
+                f"Config 'mailboxes' lists {address} more than once. Two entries for "
+                "one mailbox leaves the enabled flag ambiguous."
+            )
+        seen.add(address)
+
+        normalized.append({"address": address, "enabled": enabled})
+
+    enabled_addresses = [entry["address"] for entry in normalized if entry["enabled"]]
+    if not enabled_addresses:
+        raise SystemProblem(
+            f"Config at {path} has every mailbox disabled. A pass over nothing "
+            "finishes clean and looks like success, so this is an error instead."
+        )
+
+    config["mailboxes"] = normalized
+    config["enabled_mailboxes"] = enabled_addresses
+
+
 def _validate_review_pair(stac: dict) -> None:
     """Check the Type/Subtype that unclassified attachments are filed under.
 
@@ -258,3 +329,26 @@ def _resolve_paths(config: dict) -> None:
         resolved[key] = candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
 
     config["paths"] = resolved
+
+
+def mailbox_addresses(config: dict, enabled_only: bool = True) -> list[str]:
+    """Pull mailbox addresses out of a raw or validated config.
+
+    For the hand-run scripts, which read config.yaml with yaml.safe_load and
+    never call load_config, so they have no `enabled_mailboxes` key. DALYN
+    itself should use config["enabled_mailboxes"].
+
+    Args:
+        config: Parsed config.yaml, validated or not.
+        enabled_only: False returns every listed address regardless of its
+            flag. Only check_graph.py wants this, because Exchange RBAC
+            scoping is server-side and has to be verifiable on a mailbox that
+            is switched off here.
+    """
+    entries = config.get("mailboxes") or []
+    return [
+        str(entry["address"]).strip().lower()
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("address")
+        and (not enabled_only or entry.get("enabled") is True)
+    ]

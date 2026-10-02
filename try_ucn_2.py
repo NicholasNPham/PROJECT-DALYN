@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, "src")
+from config_loader import mailbox_addresses
 from graph_client import GraphClient
 from ocr import extract_text
 from ucn import find_ucn
@@ -14,15 +15,23 @@ from ucn import find_ucn
 with open("config/config.yaml", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
+# Raw yaml, so enabled_mailboxes does not exist here: load_config adds it and
+# this script does not call it.
+MAILBOXES = mailbox_addresses(config)
+if not MAILBOXES:
+    sys.exit("No enabled mailboxes in config.yaml.")
+
 graph = config["graph"]
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=config["mailboxes"],
+    allowed_mailboxes=MAILBOXES,
 )
 
-mailbox = config["mailboxes"][0]
+mailbox = MAILBOXES[0]
+print(f"Reading {mailbox}")
+
 messages = client.list_messages(
     mailbox=mailbox,
     days_back=config["days_back"],
@@ -41,14 +50,16 @@ for index, message in enumerate(messages):
         if "contentBytes" not in attachment:
             continue
         try:
-            text = extract_text(base64.b64decode(attachment["contentBytes"]), attachment["name"])
+            text, _ = extract_text(
+                base64.b64decode(attachment["contentBytes"]), attachment["name"]
+            )
             doc_ucn = find_ucn(text)
         except Exception as error:
             print(f"{index:03d}: {type(error).__name__}: {error}")
         break
 
-    subject_ucn = find_ucn(subject)
-    body_ucn = find_ucn(body)
+    subject_ucn = find_ucn("", subject=subject)
+    body_ucn = find_ucn("", body=body)
 
     counts["document"] += bool(doc_ucn)
     counts["subject"] += bool(subject_ucn)

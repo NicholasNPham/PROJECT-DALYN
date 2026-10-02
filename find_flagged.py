@@ -24,6 +24,11 @@ saves into temp/flagged/:
     NN_email.eml     the raw email, for when Outlook cooperates
     NN_<file>.pdf    each attachment, for diag.py
 
+A CSV can cover several mailboxes, and each email is looked up in its own.
+If a mailbox in the CSV has since been disabled in config, this fails with
+"Refusing request: mailbox not on allowlist" rather than anything about
+flags: re-enable it, or use the config that produced the CSV.
+
 temp/ holds real case documents. Confirm it is gitignored, and delete
 temp/flagged when done.
 
@@ -104,7 +109,7 @@ client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=config["mailboxes"],
+    allowed_mailboxes=config["enabled_mailboxes"],
 )
 
 with open(args.csv_path, encoding="utf-8-sig", newline="") as handle:
@@ -122,10 +127,21 @@ for row in rows:
 if not selected:
     sys.exit("Nothing matched in that CSV.")
 
-mailbox = rows[0]["mailbox"]
-deleted_items_id = client._request(
-    "GET", client._mailbox_url(mailbox, "mailFolders/deleteditems"), params={"$select": "id"}
-).json()["id"]
+# Each email is looked up in the mailbox it came from. A CSV can now cover
+# several, and a Graph message id only means anything against its own mailbox.
+deleted_items_ids: dict[str, str] = {}
+
+
+def deleted_items_id_for(mailbox: str) -> str:
+    """Deleted Items folder id for one mailbox, fetched once per mailbox."""
+    if mailbox not in deleted_items_ids:
+        deleted_items_ids[mailbox] = client._request(
+            "GET",
+            client._mailbox_url(mailbox, "mailFolders/deleteditems"),
+            params={"$select": "id"},
+        ).json()["id"]
+    return deleted_items_ids[mailbox]
+
 
 out = Path("temp/flagged")
 out.mkdir(parents=True, exist_ok=True)
@@ -237,8 +253,9 @@ def render_html(number: int, label: str, message: dict, where: str, saved: list[
 
 for number, (message_id, message_rows) in enumerate(selected.items(), start=1):
     first = message_rows[0]
+    mailbox = first["mailbox"]
     label = label_for(message_rows)
-    print(f"\n[{number:02d}] {label}, received {first['received_utc']} UTC")
+    print(f"\n[{number:02d}] {label}, {mailbox}, received {first['received_utc']} UTC")
     for row in message_rows:
         print(f"     {row['attachment_name']}: {row['outcome']} "
               f"{row['classified_type'] or '-'}/{row['classified_subtype'] or '-'} "
@@ -257,7 +274,11 @@ for number, (message_id, message_rows) in enumerate(selected.items(), start=1):
         continue
 
     sender = message.get("from", {}).get("emailAddress", {}).get("address", "?")
-    where = "Deleted Items" if message.get("parentFolderId") == deleted_items_id else "MOVED out of Deleted Items"
+    where = (
+        "Deleted Items"
+        if message.get("parentFolderId") == deleted_items_id_for(mailbox)
+        else "MOVED out of Deleted Items"
+    )
     print(f"     subject: {message.get('subject')}")
     print(f"     from:    {sender}")
     print(f"     folder:  {where}")
