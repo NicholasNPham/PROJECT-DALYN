@@ -20,7 +20,7 @@ import shutil
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -684,17 +684,22 @@ def _write_csv(rows: list[dict], path: Path) -> None:
 
 
 def run_dry_run(config: dict, limit: int | None = None) -> int:
-    """One pass over Deleted Items of the first configured mailbox.
+    """One pass over the source folder of every enabled mailbox, in file order.
+
+    Mailboxes are read one at a time to completion. The messages are not merged
+    into one list: nothing is gained by interleaving them, and oldest-first
+    resume is a per-mailbox cursor whenever it arrives.
 
     Args:
         config: From load_config.
-        limit: Process only the first N messages after sorting and after
-            attachment-less mail is dropped. With newest_first, --limit 1
-            is the newest email that has attachments.
+        limit: Tighten max_messages for this pass. Counted across all enabled
+            mailboxes, so --limit 1 is one email in total, from whichever
+            mailbox is listed first.
 
     Raises:
-        SystemProblem: Rules sheet, Graph or Tesseract failure. Whatever
-            rows were built before the failure are still written.
+        SystemProblem: Rules sheet, Graph or Tesseract failure, or five
+            consecutive STAC failures. Whatever rows were built before the
+            failure are still written to the CSV.
     """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = config["paths"]["logs"] / f"decisions_{stamp}.csv"
@@ -714,64 +719,94 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
         tenant_id=graph["tenant_id"],
         client_id=graph["client_id"],
         client_secret=graph["client_secret"],
-        allowed_mailboxes=config["mailboxes"],
+        allowed_mailboxes=config["enabled_mailboxes"],
     )
 
-    # First iteration reads one mailbox. The allowlist can hold all three;
-    # the first entry is the one read, so keep felony Polk at the top.
-    mailbox = config["mailboxes"][0]
-
-    messages = client.list_messages(
-        mailbox,
-        days_back=config["days_back"],
-        max_messages=config["max_messages"],
-        newest_first=config["newest_first"],
-    )
+    # max_messages bounds the whole pass, not each mailbox. The number exists
+    # to keep the pile of decisions a person checks by hand reasonable, and a
+    # reviewer does not care which mailbox a row came from. --limit tightens
+    # the same budget rather than introducing a second one.
+    budget = config["max_messages"]
     if limit is not None:
-        messages = messages[:limit]
-
-    source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
+        budget = min(budget, limit)
 
     order = "newest first" if config["newest_first"] else "oldest first"
-    logger.info("Dry run: %s message(s) from %s, %s", len(messages), mailbox, order)
+    logger.info(
+        "Dry run: up to %s message(s) across %s, %s",
+        budget,
+        ", ".join(config["enabled_mailboxes"]),
+        order,
+    )
 
     work_dir = config["paths"]["temp"] / f"stac_{stamp}"
 
     rows: list[dict] = []
     stac_failures = 0
+    # Continuous across the whole pass, not reset per mailbox. Two emails both
+    # numbered 1 would write colliding file names into work_dir, since the name
+    # is built from the number, and would be ambiguous to talk about from the
+    # CSV afterwards.
+    email_number = 0
+
     try:
-        # One browser for the whole pass. Opened before the first message so a
-        # bad password or an unreachable STAC stops the run immediately rather
-        # than after fifty documents have been OCR'd for nothing.
+        # One browser for the whole pass, all mailboxes. Opened before the
+        # first message so a bad password or an unreachable STAC stops the run
+        # immediately rather than after fifty documents have been OCR'd for
+        # nothing.
         with StacRunner(config) as runner:
-            for number, message in enumerate(messages, start=1):
-                logger.info(
-                    "Message %s of %s, received %s",
-                    number,
-                    len(messages),
-                    message.get("receivedDateTime"),
-                )
-                email_rows = _process_message(client, mailbox, message, rules, source_folder_id)
-                summary = _decide_email(email_rows, number)
-
-                if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
-                    if _enter_in_stac(runner, email_rows, work_dir, number):
-                        stac_failures = 0
-                    else:
-                        stac_failures += 1
-                    # The STAC result can turn an UPLOAD into a Manual Review,
-                    # so the summary is re-read afterwards rather than before.
-                    summary = _decide_email(email_rows, number, keep_decision=True)
-
-                logger.info(summary)
-                rows.extend(email_rows)
-
-                if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
-                    raise SystemProblem(
-                        f"{stac_failures} emails in a row failed inside STAC. Stopping "
-                        "rather than working through the rest of the mailbox against "
-                        "something that is not answering."
+            for mailbox in config["enabled_mailboxes"]:
+                remaining = budget - email_number
+                if remaining <= 0:
+                    logger.info(
+                        "Budget of %s message(s) is used up. %s was not read this pass.",
+                        budget,
+                        mailbox,
                     )
+                    break
+
+                messages = client.list_messages(
+                    mailbox,
+                    days_back=config["days_back"],
+                    max_messages=remaining,
+                    newest_first=config["newest_first"],
+                )
+                source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
+                logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
+
+                for position, message in enumerate(messages, start=1):
+                    email_number += 1
+                    logger.info(
+                        "%s message %s of %s (email %s), received %s",
+                        mailbox,
+                        position,
+                        len(messages),
+                        email_number,
+                        message.get("receivedDateTime"),
+                    )
+                    email_rows = _process_message(
+                        client, mailbox, message, rules, source_folder_id
+                    )
+                    summary = _decide_email(email_rows, email_number)
+
+                    if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
+                        if _enter_in_stac(runner, email_rows, work_dir, email_number):
+                            stac_failures = 0
+                        else:
+                            stac_failures += 1
+                        # The STAC result can turn an UPLOAD into a Manual
+                        # Review, so the summary is re-read afterwards rather
+                        # than before.
+                        summary = _decide_email(email_rows, email_number, keep_decision=True)
+
+                    logger.info(summary)
+                    rows.extend(email_rows)
+
+                    if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
+                        raise SystemProblem(
+                            f"{stac_failures} emails in a row failed inside STAC. "
+                            "Stopping rather than working through the rest of the "
+                            "mailboxes against something that is not answering."
+                        )
     finally:
         # Real case documents. Gone whether the pass finished or crashed.
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -789,6 +824,15 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
             count = email_counts.get((email_type, decision))
             if count:
                 logger.info("  %-8s %-13s %s", email_type, decision, count)
+
+    # Which mailbox a pass actually got through. With one enabled this repeats
+    # the totals below; with three it is the only place the split shows, and
+    # the case worth catching is one busy mailbox eating the whole budget.
+    if len(config["enabled_mailboxes"]) > 1:
+        per_mailbox = Counter(row["mailbox"] for row in rows)
+        logger.info("Attachments by mailbox:")
+        for address in config["enabled_mailboxes"]:
+            logger.info("  %-40s %s", address, per_mailbox.get(address, 0))
 
     counts = Counter(row["outcome"] for row in rows)
     logger.info("Attachments: %s", len(rows))

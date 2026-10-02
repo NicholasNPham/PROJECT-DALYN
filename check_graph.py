@@ -2,7 +2,16 @@
 
 NOTE: the app currently has tenant-wide mail access. This script cannot
 prove scoping, because nothing is scoped. It proves auth works and that
-the three configured addresses resolve to the mailboxes we expect.
+every configured address resolves to the mailbox we expect.
+
+Reads EVERY configured address, enabled or not. Exchange RBAC scoping is
+server-side and independent of DALYN's own allowlist, so a mailbox switched
+off in config still has to be verifiable here. This is the one file that
+deliberately looks outside what DALYN itself is allowed to read.
+
+What a 200 means depends on the flag printed next to it:
+    enabled  + 200  RBAC lets DALYN in, and DALYN will read it
+    DISABLED + 200  RBAC would let DALYN in if the flag were turned on
 
 Keep until the Exchange scope is applied, then re-run to verify cutover.
 """
@@ -14,17 +23,23 @@ import requests
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+from config_loader import mailbox_addresses
 from graph_client import GRAPH_BASE_URL, GraphClient
 
 with open("config/config.yaml", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
 graph = config["graph"]
+
+ALL_MAILBOXES = mailbox_addresses(config, enabled_only=False)
+if not ALL_MAILBOXES:
+    sys.exit("No mailboxes in config.yaml.")
+
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=config["mailboxes"],
+    allowed_mailboxes=ALL_MAILBOXES,
 )
 
 print("Allowlist:", sorted(client._allowed_mailboxes))
@@ -65,8 +80,10 @@ def check(mailbox: str) -> None:
 
 
 print("--- Configured mailboxes (all should be 200) ---")
-for mailbox in config["mailboxes"]:
-    check(mailbox)
+for entry in config["mailboxes"]:
+    state = "enabled" if entry.get("enabled") else "DISABLED in config"
+    print(f"[{state}]")
+    check(str(entry["address"]).strip().lower())
 
 print("\n--- Out-of-scope control ---")
 check(OUT_OF_SCOPE)
@@ -77,7 +94,7 @@ print(
 
 # --- Dry run listing test, temporary ---
 messages = client.list_messages(
-    mailbox=config["mailboxes"][0],
+    mailbox=ALL_MAILBOXES[0],
     days_back=config["days_back"],
     max_messages=config["max_messages"],
     newest_first=config["newest_first"],
@@ -88,7 +105,7 @@ for message in messages[:5]:
     print(f"  {message['receivedDateTime']}  {message['id'][:40]}...")
 
 if messages:
-    files = client.get_attachments(config["mailboxes"][0], messages[0]["id"])
+    files = client.get_attachments(ALL_MAILBOXES[0], messages[0]["id"])
     print(f"\nFirst message has {len(files)} usable file(s):")
     for attachment in files:
         size_kb = attachment.get("size", 0) // 1024

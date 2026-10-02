@@ -90,7 +90,10 @@ class GraphClient:
 
         This is the only place in DALYN that builds a /users/ URL. The app
         credential currently has tenant-wide mail access, so this check is the
-        sole thing keeping DALYN inside its three mailboxes. Do not bypass it.
+        sole thing keeping DALYN inside the mailboxes it is allowed to read.
+        The list comes from the enabled entries in config, not every entry, so
+        a mailbox switched off in config is unreachable here rather than merely
+        unvisited. Do not bypass it.
 
         Args:
             mailbox: SMTP address of the target mailbox.

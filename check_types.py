@@ -22,7 +22,11 @@ from openpyxl import load_workbook
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 import classifier  # noqa: E402
-from config_loader import load_config  # noqa: E402
+from config_loader import (  # noqa: E402
+    LIVE_REVIEW_SUBTYPE,
+    LIVE_REVIEW_TYPE,
+    load_config,
+)
 from exceptions import SystemProblem  # noqa: E402
 from logger import setup_logging  # noqa: E402
 
@@ -86,11 +90,16 @@ def check_review_pair(
     saw it. That gap is exactly how a run reached STAC and failed on every
     unclassified document with "no row for PLS/RVW": the rules all checked out
     and the one hardcoded pair was never looked at.
+
+    The fallbacks come from config_loader rather than being written out here.
+    They should never fire, since _validate_review_pair fills both keys, but a
+    literal "PLS"/"RVW" written in this file would be the exact wrong pair
+    sitting inside the script whose job is catching wrong pairs.
     """
     stac = config.get("stac", {})
     key = (
-        str(stac.get("review_type", "PLS")).strip().upper(),
-        str(stac.get("review_subtype", "RVW")).strip().upper(),
+        str(stac.get("review_type", LIVE_REVIEW_TYPE)).strip().upper(),
+        str(stac.get("review_subtype", LIVE_REVIEW_SUBTYPE)).strip().upper(),
     )
     label = f"{key[0]}/{key[1]}"
 
