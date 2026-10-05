@@ -13,6 +13,15 @@ What a 200 means depends on the flag printed next to it:
     enabled  + 200  RBAC lets DALYN in, and DALYN will read it
     DISABLED + 200  RBAC would let DALYN in if the flag were turned on
 
+The out-of-scope control is config.yaml's rbac_control_mailbox: any real
+mailbox outside the allowlist. It should answer 200 while access is
+tenant-wide and 403 once the Exchange scope is applied. Left unset, the
+control check is skipped.
+
+Reads config.yaml raw rather than through load_config, so a STAC setting
+problem cannot stop a Graph diagnostic. The client secret still comes from
+Credential Manager.
+
 Keep until the Exchange scope is applied, then re-run to verify cutover.
 """
 
@@ -23,13 +32,20 @@ import requests
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from config_loader import mailbox_addresses
-from graph_client import GRAPH_BASE_URL, GraphClient
+from config_loader import mailbox_addresses  # noqa: E402
+from credential import load_credentials  # noqa: E402
+from exceptions import SystemProblem  # noqa: E402
+from graph_client import GRAPH_BASE_URL, GraphClient  # noqa: E402
 
 with open("config/config.yaml", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
 graph = config["graph"]
+
+try:
+    client_secret = load_credentials()["graph_client_secret"]
+except SystemProblem as error:
+    sys.exit(f"Credential problem: {error}")
 
 ALL_MAILBOXES = mailbox_addresses(config, enabled_only=False)
 if not ALL_MAILBOXES:
@@ -38,7 +54,7 @@ if not ALL_MAILBOXES:
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
-    client_secret=graph["client_secret"],
+    client_secret=client_secret,
     allowed_mailboxes=ALL_MAILBOXES,
 )
 
@@ -49,7 +65,7 @@ token = client._get_token()
 headers = {"Authorization": f"Bearer {token}"}
 print("Token acquired.\n")
 
-OUT_OF_SCOPE = "npham@sao10.com"
+OUT_OF_SCOPE = (config.get("rbac_control_mailbox") or "").strip().lower()
 
 
 def check(mailbox: str) -> None:
@@ -86,11 +102,16 @@ for entry in config["mailboxes"]:
     check(str(entry["address"]).strip().lower())
 
 print("\n--- Out-of-scope control ---")
-check(OUT_OF_SCOPE)
-print(
-    "200 above is EXPECTED while access is tenant-wide.\n"
-    "After the Exchange scope is applied it must become 403."
-)
+if not OUT_OF_SCOPE:
+    print("Skipped: set rbac_control_mailbox in config.yaml to a mailbox outside the allowlist.")
+elif OUT_OF_SCOPE in ALL_MAILBOXES:
+    print(f"Skipped: {OUT_OF_SCOPE} is one of DALYN's own mailboxes, so it proves nothing.")
+else:
+    check(OUT_OF_SCOPE)
+    print(
+        "200 above is EXPECTED while access is tenant-wide.\n"
+        "After the Exchange scope is applied it must become 403."
+    )
 
 # --- Dry run listing test, temporary ---
 messages = client.list_messages(

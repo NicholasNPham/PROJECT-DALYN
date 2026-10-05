@@ -23,7 +23,6 @@ import classifier  # noqa: E402
 import ocr  # noqa: E402
 import ucn  # noqa: E402
 from config_loader import load_config  # noqa: E402
-from exceptions import DocumentProblem  # noqa: E402
 from logger import setup_logging  # noqa: E402
 from exceptions import DocumentProblem, SystemProblem  # noqa: E402
 
@@ -47,10 +46,7 @@ def main() -> int:
     folder = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT_ROOT / "temp" / "sample"
     out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else PROJECT_ROOT / "review_report.csv"
 
-    config = load_config()
-    setup_logging(config["paths"]["logs"])
-
-    config = load_config()
+    config = load_config(with_credentials=False)
     setup_logging(config["paths"]["logs"])
 
     try:

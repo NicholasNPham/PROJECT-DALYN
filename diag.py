@@ -53,7 +53,7 @@ def main() -> int:
         print(f"No PDFs in {target}")
         return 2
 
-    config = load_config()
+    config = load_config(with_credentials=False)
 
     # review_batch.py does this before reading anything. Without it, any
     # document that needs OCR dies on "Tesseract is not installed".

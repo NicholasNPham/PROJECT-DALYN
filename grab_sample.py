@@ -1,6 +1,6 @@
 """Throwaway: save a sample of attachments to disk for offline OCR development.
 
-Writes real case documents to temp/sample. Confirm temp/ is gitignored,
+Writes real case documents to temp/sample10. Confirm temp/ is gitignored,
 and delete the folder when done.
 """
 
@@ -8,31 +8,27 @@ import base64
 import sys
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from config_loader import mailbox_addresses
-from graph_client import GraphClient
+from config_loader import load_config  # noqa: E402
+from exceptions import SystemProblem  # noqa: E402
+from graph_client import GraphClient  # noqa: E402
 
-with open("config/config.yaml", encoding="utf-8") as config_file:
-    config = yaml.safe_load(config_file)
-
-# Raw yaml, so there is no enabled_mailboxes key: that one is added by
-# load_config, which this script does not call. Enabled only, since this pulls
-# real case documents out of a live mailbox.
-MAILBOXES = mailbox_addresses(config)
-if not MAILBOXES:
-    sys.exit("No enabled mailboxes in config.yaml.")
+try:
+    # Through load_config, so the secret comes from Credential Manager and the
+    # allowlist is the enabled mailboxes only: this reads live case mail.
+    config = load_config()
+except SystemProblem as error:
+    sys.exit(f"Config problem: {error}")
 
 graph = config["graph"]
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=MAILBOXES,
+    allowed_mailboxes=config["enabled_mailboxes"],
 )
 
-mailbox = MAILBOXES[0]
+mailbox = config["enabled_mailboxes"][0]
 out = Path("temp/sample10")
 
 if out.exists():

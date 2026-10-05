@@ -1,9 +1,17 @@
-"""Loads and validates config.yaml. The only file that reads config from disk."""
+"""Loads and validates config.yaml. The only file that reads config from disk.
+
+Secrets are not in config.yaml. They come from Windows Credential Manager via
+credential.py and are attached to the config here, after validation, so the
+rest of DALYN reads config["graph"]["client_secret"] and config["stac"]
+["username"] / ["password"] exactly as before and never knows where they came
+from.
+"""
 
 from pathlib import Path
 
 import yaml
 
+from credential import load_credentials
 from exceptions import SystemProblem
 from logger import get_logger
 
@@ -21,8 +29,17 @@ REQUIRED_KEYS = (
     "stac",
     "paths",
 )
-REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id", "client_secret")
-REQUIRED_STAC_KEYS = ("url", "username", "password")
+REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id")
+REQUIRED_STAC_KEYS = ("url",)
+
+# Settings that used to live in config.yaml and now come from Credential
+# Manager. Their presence in the file is refused outright, whatever the value,
+# so an old config.yaml still carrying a live secret cannot go on working
+# quietly, and a copy of it handed to someone else is not a copy of the secret.
+MOVED_TO_CREDENTIAL_MANAGER = {
+    "graph": ("client_secret",),
+    "stac": ("username", "password"),
+}
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 MAILBOX_KEYS = ("address", "enabled")
 
@@ -42,8 +59,8 @@ LIVE_REVIEW_SUBTYPE = "PLS RVW"
 logger = get_logger(__name__)
 
 
-def load_config(config_path: Path | None = None) -> dict:
-    """Read config.yaml, validate it, and resolve relative paths.
+def load_config(config_path: Path | None = None, with_credentials: bool = True) -> dict:
+    """Read config.yaml, validate it, resolve relative paths, and attach secrets.
 
     Paths under `paths` are resolved against the project root, not the working
     directory, so DALYN behaves the same when launched by Task Scheduler as it
@@ -52,12 +69,18 @@ def load_config(config_path: Path | None = None) -> dict:
 
     Args:
         config_path: Override for the config file location. Tests use this.
+        with_credentials: False skips Credential Manager entirely, for tools
+            that never sign in to anything (check_types, diag, review_batch).
+            The secret keys are then simply absent from the returned config.
 
     Returns:
-        The config dict, with `paths` values replaced by absolute Path objects.
+        The config dict, with `paths` values replaced by absolute Path objects
+        and, unless with_credentials is False, graph.client_secret,
+        stac.username and stac.password filled from Credential Manager.
 
     Raises:
-        SystemProblem: If the file is missing, unparseable, or incomplete.
+        SystemProblem: If the file is missing, unparseable, incomplete, still
+            holds a secret, or Credential Manager is missing one.
     """
     path = config_path or DEFAULT_CONFIG_PATH
 
@@ -76,11 +99,13 @@ def load_config(config_path: Path | None = None) -> dict:
 
     _validate(config, path)
     _resolve_paths(config)
+    if with_credentials:
+        _attach_credentials(config)
 
     stac = config["stac"]
     logger.info(
         "Config loaded from %s (dry_run=%s, mailboxes=%s of %s enabled: %s, "
-        "stac=%s, test=%s, upload=%s, save=%s)",
+        "stac=%s, test=%s, upload=%s, save=%s, secrets=%s)",
         path,
         config["dry_run"],
         len(config["enabled_mailboxes"]),
@@ -90,6 +115,7 @@ def load_config(config_path: Path | None = None) -> dict:
         stac.get("is_test_instance", True),
         stac.get("upload_enabled", False),
         stac.get("save_enabled", False),
+        "Credential Manager" if with_credentials else "not loaded",
     )
 
     return config
@@ -105,6 +131,8 @@ def _validate(config: dict, path: Path) -> None:
     if missing:
         raise SystemProblem(f"Config at {path} is missing keys: {', '.join(missing)}")
 
+    _refuse_stored_secrets(config, path)
+
     graph = config["graph"]
     if not isinstance(graph, dict):
         raise SystemProblem("Config key 'graph' must be a mapping.")
@@ -112,7 +140,7 @@ def _validate(config: dict, path: Path) -> None:
     blank = [key for key in REQUIRED_GRAPH_KEYS if not graph.get(key)]
     if blank:
         raise SystemProblem(
-            f"Config at {path} has empty graph credentials: {', '.join(blank)}"
+            f"Config at {path} has empty graph settings: {', '.join(blank)}"
         )
 
     _validate_mailboxes(config, path)
@@ -184,6 +212,43 @@ def _validate(config: dict, path: Path) -> None:
     missing_paths = [key for key in PATH_KEYS if not paths.get(key)]
     if missing_paths:
         raise SystemProblem(f"Config 'paths' is missing: {', '.join(missing_paths)}")
+
+
+def _refuse_stored_secrets(config: dict, path: Path) -> None:
+    """Stop if config.yaml still holds anything that now lives in Credential Manager.
+
+    Checked for presence, not value: a placeholder like PASTE-SECRET-VALUE is
+    refused too, so config.example.yaml and every real config.yaml end up with
+    the keys gone rather than blanked, and there is one shape to compare.
+
+    Raises:
+        SystemProblem: Naming every offending key at once.
+    """
+    found = [
+        f"{section}.{key}"
+        for section, keys in MOVED_TO_CREDENTIAL_MANAGER.items()
+        if isinstance(config.get(section), dict)
+        for key in keys
+        if key in config[section]
+    ]
+    if found:
+        raise SystemProblem(
+            f"Config at {path} still contains {', '.join(found)}. These now live "
+            "in Windows Credential Manager: store them with set_credentials.py, "
+            "then delete those lines from config.yaml."
+        )
+
+
+def _attach_credentials(config: dict) -> None:
+    """Fill the secrets in from Credential Manager, after validation has passed.
+
+    After validation on purpose: a malformed config.yaml is reported as that,
+    without first touching Credential Manager.
+    """
+    secrets = load_credentials()
+    config["graph"]["client_secret"] = secrets["graph_client_secret"]
+    config["stac"]["username"] = secrets["stac_username"]
+    config["stac"]["password"] = secrets["stac_password"]
 
 
 def _validate_mailboxes(config: dict, path: Path) -> None:

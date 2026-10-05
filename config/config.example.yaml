@@ -1,10 +1,15 @@
 # Copy to config.yaml and fill in. config.yaml is gitignored, never commit it.
 
-# Microsoft Graph app registration
+# Microsoft Graph app registration. Identifiers only: the client secret lives
+# in Windows Credential Manager. Run set_credentials.py once per machine.
 graph:
   tenant_id: "PASTE-TENANT-ID"
   client_id: "PASTE-CLIENT-ID"
-  client_secret: "PASTE-SECRET-VALUE"   # the secret Value, not the Secret ID
+
+# Used only by check_graph.py: a real mailbox OUTSIDE the list below, to prove
+# Exchange RBAC refuses it. Expect 200 while access is tenant-wide, 403 after
+# the scope is applied. Leave blank to skip that check.
+rbac_control_mailbox: ""
 
 # Mailboxes DALYN is permitted to touch. Full SMTP addresses, not aliases.
 #
@@ -50,8 +55,7 @@ newest_first: true
 # is intended, and expect to change code as well.
 stac:
   url: "https://stac-test.example.com"
-  username: "PASTE-STAC-USERNAME"
-  password: "PASTE-STAC-PASSWORD"
+  # username and password live in Windows Credential Manager, not here.
   is_test_instance: true
 
   # Two switches, three stages. Work down the list.

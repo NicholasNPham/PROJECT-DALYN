@@ -126,7 +126,7 @@ def check_review_pair(
 
 def main() -> int:
     try:
-        config = load_config()
+        config = load_config(with_credentials=False)
     except SystemProblem as error:
         print(f"Config problem: {error}", file=sys.stderr)
         return 1

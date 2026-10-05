@@ -4,32 +4,27 @@ import base64
 import sys
 from pathlib import Path
 
-import yaml
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from config_loader import load_config  # noqa: E402
+from exceptions import SystemProblem  # noqa: E402
+from graph_client import GraphClient  # noqa: E402
+from ocr import extract_text  # noqa: E402
+from ucn import find_ucn  # noqa: E402
 
-sys.path.insert(0, "src")
-from config_loader import mailbox_addresses
-from graph_client import GraphClient
-from ocr import extract_text
-from ucn import find_ucn
-
-with open("config/config.yaml", encoding="utf-8") as config_file:
-    config = yaml.safe_load(config_file)
-
-# Raw yaml, so enabled_mailboxes does not exist here: load_config adds it and
-# this script does not call it.
-MAILBOXES = mailbox_addresses(config)
-if not MAILBOXES:
-    sys.exit("No enabled mailboxes in config.yaml.")
+try:
+    config = load_config()
+except SystemProblem as error:
+    sys.exit(f"Config problem: {error}")
 
 graph = config["graph"]
 client = GraphClient(
     tenant_id=graph["tenant_id"],
     client_id=graph["client_id"],
     client_secret=graph["client_secret"],
-    allowed_mailboxes=MAILBOXES,
+    allowed_mailboxes=config["enabled_mailboxes"],
 )
 
-mailbox = MAILBOXES[0]
+mailbox = config["enabled_mailboxes"][0]
 print(f"Reading {mailbox}")
 
 messages = client.list_messages(
