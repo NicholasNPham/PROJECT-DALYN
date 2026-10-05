@@ -1,13 +1,60 @@
-__pycache__/
-*.pyc
-.idea/
-.pytest_cache/
-.venv/
+# ---------------------------------------------------------------- secrets
+# The client secret and STAC login live in Windows Credential Manager, not
+# here. config.yaml still names the tenant, the app registration, the STAC
+# address and the mailboxes, so it stays out too. Both spellings, in case the
+# project is ever laid out flat in the root.
+config.yaml
 config/config.yaml
-logs/
-temp/
+key.py
+# Certificate for Graph, the planned upgrade from a client secret.
 *.pfx
 *.cer
+*.pem
+
+# ------------------------------------------------------------ case material
+# Real case documents: pulled by find_flagged.py and grab_sample.py, and
+# written for upload while a STAC pass runs. Filings carry defendant names.
+temp/
+
+# Decision CSVs and review reports carry case numbers and attachment names.
+*.csv
+
+# The rules sheet and STAC's Type/Subtype export are office data, kept on
+# the network share rather than in a public repository.
 *.xlsx
-review_report.csv
-decisions_*.csv
+*.xlsm
+*.xls
+
+# ------------------------------------------------------------------- output
+logs/
+*.log
+
+# ------------------------------------------------------------- claude code
+# Local agent settings and project notes. They describe how this tool
+# handles case data and secrets, so they stay on this machine.
+.claude/
+CLAUDE.md
+
+# -------------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----------------------------------------------------------------- editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# ------------------------------------------------------------------- os junk
+.DS_Store
+Thumbs.db
+desktop.ini
