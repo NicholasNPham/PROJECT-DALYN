@@ -26,6 +26,15 @@ MAX_PAGES = 200
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 300
 
+# Always retried: Microsoft is throttling or briefly down, and nothing was done.
+RETRY_ANY_METHOD = frozenset({429, 503})
+
+# Retried for GET only. A gateway error means the front end lost touch with
+# the mail server, which may already have acted on the request, so a PATCH or
+# POST could be applied twice. A GET only reads. Added after a dry run on
+# 6 Oct 2026 stopped on a single 502 UnknownError from a GET.
+RETRY_GET_ONLY = frozenset({502, 504})
+
 logger = get_logger(__name__)
 
 
@@ -160,7 +169,9 @@ class GraphClient:
             if response.status_code == 404 and gone_on_404:
                 raise MessageGone("Graph returned 404 for this message")
 
-            if response.status_code in (429, 503):
+            if response.status_code in RETRY_ANY_METHOD or (
+                response.status_code in RETRY_GET_ONLY and method.upper() == "GET"
+            ):
                 wait = self._retry_delay(response, attempt)
                 logger.warning(
                     "Graph returned %s, waiting %ss (attempt %s of %s)",
@@ -178,7 +189,7 @@ class GraphClient:
             )
 
         raise SystemProblem(
-            f"Graph {method} still throttled after {MAX_RETRIES} attempts"
+            f"Graph {method} still failing after {MAX_RETRIES} attempts"
         )
 
     @staticmethod
