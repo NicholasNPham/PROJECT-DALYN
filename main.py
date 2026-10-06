@@ -8,8 +8,9 @@ Two outputs per run:
     logs/dalyn.log                   what happened, for Nick
     logs/decisions_<run stamp>.csv   one row per attachment, for the reviewer
 
-Subject and body are read in memory for UCN extraction only. They are never
-written to either output because they carry defendant names.
+Subject and body are read in memory for UCN extraction and, on Highlands and
+Hardee cases, for finding STAC's defendant by name. They are never written to
+either output because they carry defendant names.
 """
 
 import argparse
@@ -81,16 +82,11 @@ CSV_COLUMNS = (
 PDF_MAGIC = b"%PDF-"
 PDF_HEADER_WINDOW = 1024
 
-# TEMPORARY, 1 Oct 2026. UCN_PATTERN in ucn.py ends in exactly two letters,
-# but Hardee uses three-letter division codes, so a Hardee number comes back
-# with its last letter missing: 25-2026-MM-000000-A000-XXW reads as
-# ...A000XX. That is a WRONG case number, not a missing one, and nothing
-# downstream can tell the difference. Until the pattern is fixed, anything
-# whose county code is not Polk goes to a person instead.
+# Counties this office files in. ucn.py reads Highlands and Hardee in their
+# own AXMX long form and their short forms, so a case number from any other
+# county is a cited case or a misread, and goes to a person.
 #   53 Polk, 25 Hardee, 28 Highlands
-# Remove this and the UCN_OTHER_COUNTY outcome once ucn.py handles three-
-# letter divisions.
-SUPPORTED_COUNTY_CODES = frozenset({"53"})
+SUPPORTED_COUNTY_CODES = frozenset({"53", "25", "28"})
 
 # Where any attachment goes that has a usable case number but matched no
 # rule. Cover letters and similar one-off correspondence vary too much to
@@ -129,9 +125,8 @@ class Outcome:
     Precedence, highest first. An attachment gets exactly one outcome:
         TOO_LARGE, NON_PDF, UNREADABLE   no text, nothing to classify
         NO_UCN                           nowhere to enter it, even if classified
-        UCN_OTHER_COUNTY                 the case number is not Polk, so it cannot
-                                         be trusted until the Hardee pattern in
-                                         ucn.py is fixed (temporary)
+        UCN_OTHER_COUNTY                 the case number is not Polk, Highlands
+                                         or Hardee
         UCN_CONFLICT                     the email and the document name different
                                          cases, or a document with no email UCN
                                          names several
@@ -234,8 +229,10 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
     pages and the embedded layer may have a corrupt caption.
 
     Returns:
-        (text, text_source, ClassificationResult, retried, document_ucns)
-        document_ucns is every distinct UCN found, in order.
+        (text, text_source, ClassificationResult, retried, document_ucns,
+        document_refs)
+        document_ucns is every distinct full UCN found, in order.
+        document_refs is every Highlands or Hardee case found, in any form.
 
     Raises:
         DocumentProblem: If the first extraction cannot produce usable text.
@@ -244,19 +241,22 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
     text, source = ocr.extract_text(pdf_bytes, filename)
     result = classifier.classify(rules, text)
     document_ucns = ucn.find_all(text)
+    document_refs = ucn.find_document_refs(text, document_ucns)
 
     if result.matched_phrase or source != TextSource.EMBEDDED:
-        return text, source, result, False, document_ucns
+        return text, source, result, False, document_ucns, document_refs
 
     try:
         text, source = ocr.extract_text(pdf_bytes, filename, force_ocr=True)
     except DocumentProblem as error:
         logger.info("%s: OCR retry failed, keeping embedded result (%s)", filename, error)
-        return text, source, result, True, document_ucns
+        return text, source, result, True, document_ucns, document_refs
 
     result = classifier.classify(rules, text)
-    document_ucns = list(dict.fromkeys(ucn.find_all(text) + document_ucns))
-    return text, source, result, True, document_ucns
+    retry_ucns = ucn.find_all(text)
+    document_ucns = list(dict.fromkeys(retry_ucns + document_ucns))
+    document_refs = list(dict.fromkeys(ucn.find_document_refs(text, retry_ucns) + document_refs))
+    return text, source, result, True, document_ucns, document_refs
 
 
 def _finish(row: dict, outcome: str, reason: str = "") -> dict:
@@ -289,7 +289,7 @@ def _process_attachment(
 
     # Filled now so early-exit rows (NON_PDF, TOO_LARGE, UNREADABLE) still
     # carry a UCN for the reviewer to join on, when the email names one case.
-    email_choice, _ = _choose_ucn(subject_ucn, body_ucns, [])
+    email_choice, _ = ucn.choose_ucn(subject_ucn, body_ucns, [])
     if email_choice:
         row["ucn"], row["ucn_source"] = email_choice
 
@@ -310,7 +310,9 @@ def _process_attachment(
         return _finish(row, Outcome.NON_PDF, f"No PDF header (Graph says {content_type})")
 
     try:
-        text, source, result, retried, document_ucns = _read_and_classify(data, name, rules)
+        text, source, result, retried, document_ucns, document_refs = _read_and_classify(
+            data, name, rules
+        )
     except DocumentProblem as error:
         return _finish(row, Outcome.UNREADABLE, f"Could not read the PDF: {error}")
 
@@ -330,8 +332,10 @@ def _process_attachment(
         row["classified_type"] = result.document_type
         row["classified_subtype"] = result.document_subtype
 
-    chosen, conflict = _choose_ucn(subject_ucn, body_ucns, document_ucns)
-    row["ucn_document"] = " ".join(document_ucns)
+    chosen, conflict = ucn.choose_ucn(subject_ucn, body_ucns, document_ucns, document_refs)
+    row["ucn_document"] = " ".join(
+        ucn.document_labels(document_ucns, document_refs, chosen[0] if chosen else None)
+    )
     row["ucn_conflict"] = "YES" if conflict else ""
     if chosen:
         row["ucn"], row["ucn_source"] = chosen
@@ -342,6 +346,13 @@ def _process_attachment(
         return _finish(row, Outcome.UCN_CONFLICT, conflict)
 
     if not row["ucn"]:
+        if document_refs:
+            return _finish(
+                row,
+                Outcome.NO_UCN,
+                "No UCN on the email, and the document names its case only in a "
+                "short form with no county, so there is nothing to search by",
+            )
         return _finish(row, Outcome.NO_UCN, "No UCN in subject, body or document")
 
     county = row["ucn"][:2]
@@ -349,8 +360,7 @@ def _process_attachment(
         return _finish(
             row,
             Outcome.UCN_OTHER_COUNTY,
-            f"Case number starts {county}, not Polk. The pattern drops the last "
-            "letter of a three-letter division, so this number may be wrong.",
+            f"Case number starts {county}, not Polk, Highlands or Hardee.",
         )
 
     if not result.is_classified:
@@ -376,73 +386,27 @@ def _process_attachment(
     return _finish(row, Outcome.WOULD_ENTER, "; ".join(notes))
 
 
-def _choose_ucn(
-    subject_ucn: str | None, body_ucns: list[str], document_ucns: list[str]
-) -> tuple[tuple[str, str] | None, str]:
-    """Pick the UCN to enter under, or say why none can be trusted.
-
-    Rules, agreed 1 Oct 2026:
-        email UCN and document agree        use it
-        email UCN, document has none        use the email UCN
-        no email UCN, document has one      use the document UCN
-        email UCN not in the document       conflict, Manual Review
-        no email UCN, document has several  conflict, Manual Review
-        nothing anywhere                    no UCN
-
-    "Email UCN" is the subject's. If the subject has none, the body's, but
-    only when the body names exactly one case: a full body often carries a
-    reply chain or forwarded history that mentions other cases, so a body
-    naming several is a conflict. When the subject has a UCN the body is
-    recorded but decides nothing, for the same reason.
-
-    A document that cites other cases still agrees if the email's UCN is
-    anywhere in it.
-
-    Returns:
-        ((ucn, source) or None, conflict reason or "").
-    """
-    if subject_ucn:
-        email_ucn, email_source = subject_ucn, "subject"
-    elif len(body_ucns) == 1:
-        email_ucn, email_source = body_ucns[0], "body"
-    elif len(body_ucns) > 1:
-        return None, (
-            f"No UCN in the subject and the body names {len(body_ucns)} cases: "
-            f"{', '.join(body_ucns)}"
-        )
-    else:
-        email_ucn, email_source = None, ""
-
-    if email_ucn:
-        if document_ucns and email_ucn not in document_ucns:
-            return None, (
-                f"Email names {email_ucn}, document names "
-                f"{', '.join(document_ucns)}"
-            )
-        return (email_ucn, email_source), ""
-
-    if len(document_ucns) > 1:
-        return None, (
-            f"No UCN on the email and the document names {len(document_ucns)} cases: "
-            f"{', '.join(document_ucns)}"
-        )
-
-    if document_ucns:
-        return (document_ucns[0], "document"), ""
-
-    return None, ""
-
-
 def _email_row(base_row: dict, subject_ucn: str | None, body_ucns: list[str]) -> dict:
     """One row standing for a whole email, for NO_FILES and GONE."""
     row = dict.fromkeys(CSV_COLUMNS, "")
     row.update(base_row)
     row["ucn_subject"] = subject_ucn or ""
     row["ucn_body"] = " ".join(body_ucns)
-    chosen, _ = _choose_ucn(subject_ucn, body_ucns, [])
+    chosen, _ = ucn.choose_ucn(subject_ucn, body_ucns, [])
     if chosen:
         row["ucn"], row["ucn_source"] = chosen
     return row
+
+
+def _email_text(message: dict) -> tuple[str, str]:
+    """Return (subject, body) of a message. Held in memory only, never logged.
+
+    Full body as plain text (list_messages asks for it). bodyPreview, the
+    first 255 characters, only as a fallback if the body did not come back.
+    """
+    subject = message.get("subject") or ""
+    body = (message.get("body") or {}).get("content") or message.get("bodyPreview") or ""
+    return subject, body
 
 
 def _process_message(
@@ -451,7 +415,8 @@ def _process_message(
     """Return one CSV row per attachment, or a single NO_FILES or GONE row.
 
     Subject and body are read here only to pull UCNs out of them, and
-    are then dropped. They never reach the log or the CSV.
+    are then dropped. They never reach the log or the CSV. _enter_in_stac
+    reads them again from the message for the name check.
 
     The message is checked to still be in the source folder before anything
     is read. Anyone with access to the mailbox can move or delete mail while
@@ -461,10 +426,8 @@ def _process_message(
     message_id = message["id"]
     received = message.get("receivedDateTime", "")
 
-    subject_ucn = ucn.find_ucn("", subject=message.get("subject") or "")
-    # Full body as plain text (list_messages asks for it). bodyPreview, the
-    # first 255 characters, only as a fallback if the body did not come back.
-    body_text = (message.get("body") or {}).get("content") or message.get("bodyPreview") or ""
+    subject, body_text = _email_text(message)
+    subject_ucn = ucn.find_ucn("", subject=subject)
     body_ucns = ucn.find_all(body_text)
 
     base_row = {"mailbox": mailbox, "message_id": message_id, "received_utc": received}
@@ -604,11 +567,16 @@ def _stac_documents(rows: list[dict], work_dir: Path, email_number: int) -> list
     return documents
 
 
-def _enter_in_stac(runner, rows: list[dict], work_dir: Path, email_number: int) -> bool:
+def _enter_in_stac(
+    runner, rows: list[dict], work_dir: Path, email_number: int, message: dict
+) -> bool:
     """Put one email's documents into STAC and record the result on each row.
 
     Only called for an email already decided UPLOAD, so every enterable
     attachment goes or none does.
+
+    The message is passed for its subject and body, which the Highlands and
+    Hardee name check searches for STAC's defendant.
 
     A STAC failure is recorded against this email and the pass carries on.
     One email with a page that will not settle should not end a run, and
@@ -628,9 +596,10 @@ def _enter_in_stac(runner, rows: list[dict], work_dir: Path, email_number: int) 
     # Any one document's text will do for the defendant check; the longest is
     # the most likely to carry a readable caption.
     document_text = max((row.get("_text") or "" for row in enterable), key=len)
+    subject, body = _email_text(message)
 
     try:
-        runner.enter_email(ucn_value, documents, document_text)
+        runner.enter_email(ucn_value, documents, document_text, subject, body)
     except SaveMayHaveHappened as error:
         _mark_stac(enterable, StacResult.UNKNOWN, str(error))
         logger.error("Email %s: %s", email_number, error)
@@ -789,7 +758,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                     summary = _decide_email(email_rows, email_number)
 
                     if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
-                        if _enter_in_stac(runner, email_rows, work_dir, email_number):
+                        if _enter_in_stac(runner, email_rows, work_dir, email_number, message):
                             stac_failures = 0
                         else:
                             stac_failures += 1

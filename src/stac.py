@@ -392,6 +392,19 @@ MIN_NAME_TOKENS = 2
 # rejecting every OCR typo would make this check useless noise.
 NAME_TOKEN_SIMILARITY = 0.82
 
+# Highlands and Hardee, agreed 6 Oct 2026. Their documents rarely print the
+# full case number, so the case is only filed when STAC's defendant is found
+# by name in the email or document, and Manual Review otherwise. Nick's bar
+# is 90%, stricter than the caption check above: the subject and body are
+# typed by the portal, not read by OCR.
+REQUIRED_NAME_COUNTY_CODES = frozenset({"25", "28"})
+REQUIRED_NAME_SIMILARITY = 0.90
+
+# Words either side of the first match that the rest of the name may sit in.
+# Leaves room for a middle name or "vs." between the parts of the name,
+# without letting a surname in one sentence pair with a first name in another.
+NAME_WINDOW_SLACK = 2
+
 
 class SaveMayHaveHappened(SystemProblem):
     """Save was clicked but the confirmation never came, so nobody knows.
@@ -605,13 +618,19 @@ class StacSession:
 
     # ---------------------------------------------------------------- search
 
-    def find_case(self, ucn: str, document_text: str = "") -> str:
+    def find_case(
+        self, ucn: str, document_text: str = "", subject: str = "", body: str = ""
+    ) -> str:
         """Search STAC for a UCN, check the defendant, and open the Images tab.
 
         Args:
             ucn: The case number, as DALYN extracted it.
             document_text: The document's own text, used to read the defendant
-                name out of its caption. Pass "" to skip the name check.
+                name out of its caption. Pass "" to skip the name check, for
+                Polk only; Highlands and Hardee always check.
+            subject: Email subject, searched for the defendant's name on
+                Highlands and Hardee cases. Never logged.
+            body: Email body, the same.
 
         Returns:
             The defendant name STAC shows for the case.
@@ -626,7 +645,10 @@ class StacSession:
         self._pause("case search open")
         stac_name = self._search_ucn(ucn)
         self._pause(f"found {ucn}")
-        self._check_defendant(ucn, stac_name, document_text)
+        if ucn[:2] in REQUIRED_NAME_COUNTY_CODES:
+            self._require_defendant(ucn, stac_name, subject, body, document_text)
+        else:
+            self._check_defendant(ucn, stac_name, document_text)
         self._open_images_tab(ucn)
         self._pause("images tab open")
         return stac_name
@@ -748,6 +770,16 @@ class StacSession:
                 "read wrong or the case is not in this instance."
             )
 
+        # Highlands and Hardee numbers can be rebuilt from a short form, so a
+        # search that returns several rows is not trusted to be the case.
+        # Polk is left as it was.
+        if ucn[:2] in REQUIRED_NAME_COUNTY_CODES:
+            rows = len(self.driver.find_elements(By.CSS_SELECTOR, CASE_DEFENDANT_NAME_CSS))
+            if rows > 1:
+                raise DocumentProblem(
+                    f"STAC returned {rows} cases for {ucn}, expected exactly one."
+                )
+
         try:
             return self.wait.until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, CASE_DEFENDANT_NAME_CSS))
@@ -779,18 +811,36 @@ class StacSession:
             return
 
         if names_match(stac_name, document_name):
-            logger.info("%s: defendant matches, STAC %r / document %r", ucn, stac_name, document_name)
+            logger.info("%s: defendant matches the document caption", ucn)
             return
 
-        # Both names are in the message because without them nobody can tell a
-        # real mismatch from a caption the parser read badly. They are already
-        # in the log by way of attachment filenames, so this is not new
-        # exposure, but it is the only place DALYN writes a person's name
-        # deliberately.
+        # No names in the message. Defendant names are never logged or stored;
+        # a person compares them in STAC.
         raise DocumentProblem(
-            f"Defendant mismatch on {ucn}: STAC says {stac_name!r}, the document's "
-            f"caption says {document_name!r}. Comparing words "
-            f"{sorted(_name_tokens(stac_name))} against {sorted(_name_tokens(document_name))}."
+            f"Defendant mismatch on {ucn}: STAC's defendant does not match the "
+            "document's caption."
+        )
+
+    def _require_defendant(
+        self, ucn: str, stac_name: str, subject: str, body: str, document_text: str
+    ) -> None:
+        """Find STAC's defendant by name in the subject, body or document.
+
+        For Highlands and Hardee, where finding the name is required. Unlike
+        _check_defendant, nothing is skipped: no name found anywhere is
+        Manual Review.
+
+        Raises:
+            DocumentProblem: If the name is in none of the three.
+        """
+        for source, text in (("subject", subject), ("body", body), ("document", document_text)):
+            if name_in_text(stac_name, text):
+                logger.info("%s: defendant found in the %s", ucn, source)
+                return
+
+        raise DocumentProblem(
+            f"Defendant check failed on {ucn}: STAC's defendant was not found in "
+            "the subject, body or document."
         )
 
     def _open_images_tab(self, ucn: str) -> None:
@@ -1538,9 +1588,7 @@ def names_match(stac_name: str, document_name: str) -> bool:
     # other. Going the other way would let a one-word name match anything.
     fewer, more = sorted((stac_tokens, document_tokens), key=len)
     if _every_word_has_a_near_match(fewer, more):
-        logger.info(
-            "Names matched allowing for spelling: %r and %r", stac_name, document_name
-        )
+        logger.info("Names matched allowing for spelling")
         return True
 
     return False
@@ -1555,6 +1603,67 @@ def _every_word_has_a_near_match(fewer: set, more: set) -> bool:
         if best < NAME_TOKEN_SIMILARITY:
             return False
     return True
+
+
+def name_in_text(stac_name: str, text: str) -> bool:
+    """True when STAC's defendant is named close together somewhere in text.
+
+    Every required word of STAC's name must have a word in the text at least
+    REQUIRED_NAME_SIMILARITY alike, all within a few words of each other, in
+    any order. So JOHN A SMITH, SMITH JOHN and STATE VS SMITH, JOHN ALLEN all
+    find SMITH, JOHN A, but a SMITH in one sentence and a JOHN three lines on
+    do not.
+    """
+    required = _required_name_words(stac_name)
+    if len(required) < MIN_NAME_TOKENS or not text:
+        return False
+
+    words = re.findall(r"[A-Z]+", text.upper())
+    positions = [
+        [i for i, word in enumerate(words) if _words_alike(wanted, word)]
+        for wanted in required
+    ]
+    reach = len(required) + NAME_WINDOW_SLACK
+    return any(
+        all(any(abs(p - start) <= reach for p in others) for others in positions[1:])
+        for start in positions[0]
+    )
+
+
+def _required_name_words(stac_name: str) -> list[str]:
+    """The words of STAC's name that must all be found.
+
+    STAC writes LAST, FIRST MIDDLE (FLAGS). The surname and first name are
+    required. Middle names and initials are not, since filings often leave
+    them out. A name with no comma has every word required.
+    """
+    without_flags = re.sub(r"\(.*?\)", "", stac_name)
+    if "," not in without_flags:
+        return _name_words(without_flags)
+    last, rest = without_flags.split(",", 1)
+    return _name_words(last) + _name_words(rest)[:1]
+
+
+def _name_words(name: str) -> list[str]:
+    """Uppercase words of a name in order, minus STAC's flags and initials."""
+    return [
+        word
+        for word in re.findall(r"[A-Z]+", name.upper())
+        if word not in EXCLUDED_NAME_TOKENS and len(word) > 1
+    ]
+
+
+def _words_alike(wanted: str, word: str) -> bool:
+    """True when two words are the same or REQUIRED_NAME_SIMILARITY alike."""
+    if wanted == word:
+        return True
+    matcher = SequenceMatcher(None, wanted, word)
+    # Cheap upper bounds first: a long document is tens of thousands of words.
+    return (
+        matcher.real_quick_ratio() >= REQUIRED_NAME_SIMILARITY
+        and matcher.quick_ratio() >= REQUIRED_NAME_SIMILARITY
+        and matcher.ratio() >= REQUIRED_NAME_SIMILARITY
+    )
 
 
 def _usable_driver_path(configured) -> str | None:
@@ -1675,14 +1784,23 @@ class StacRunner:
         except Exception as error:  # noqa: BLE001
             logger.warning("Could not restart the browser after a failure: %s", error)
 
-    def enter_email(self, ucn: str, documents: list, document_text: str = "") -> list:
+    def enter_email(
+        self,
+        ucn: str,
+        documents: list,
+        document_text: str = "",
+        subject: str = "",
+        body: str = "",
+    ) -> list:
         """File one email's documents on one case, retrying once if STAC wedges.
 
         Args:
             ucn: Case number for all of these documents.
             documents: (path, document_type, subtype) per attachment.
             document_text: Text of one of the documents, for the defendant
-                name check. "" skips the check.
+                name check. "" skips the check for Polk.
+            subject: Email subject, for the Highlands and Hardee name check.
+            body: Email body, the same.
 
         Returns:
             The groups entered, as [((document_type, subtype), [path, ...])].
@@ -1714,7 +1832,7 @@ class StacRunner:
                     # reload that discards an unsaved upload. Starting from
                     # the case search each time is the only state that is
                     # reliably correct.
-                    self.session.find_case(ucn, document_text)
+                    self.session.find_case(ucn, document_text, subject, body)
 
                     document_type, subtype = key
                     self.session.add_documents(ucn, document_type, subtype, paths)

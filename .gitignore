@@ -48,6 +48,13 @@ ENV/
 .mypy_cache/
 .ruff_cache/
 
+# ------------------------------------------------------------- reference
+# Working notes for Claude to read, such as the Highlands and Hardee UCN
+# write-up. Their examples can carry real case numbers. ~$ is the lock file
+# Word leaves while a document is open.
+*.docx
+~$*
+
 # ----------------------------------------------------------------- editors
 .idea/
 .vscode/

@@ -1,6 +1,7 @@
 """Finds the Uniform Case Number in a document, email body, or subject."""
 
 import re
+from typing import NamedTuple
 
 from logger import get_logger
 
@@ -20,9 +21,61 @@ from logger import get_logger
 #
 # The full 20 characters are required. A shorter pattern with dashes removed
 # would match dates, docket numbers, and bates stamps.
-UCN_PATTERN = re.compile(r"(?<!\d)(\d{6}[A-Z]{2}\d{6}[A-Z]\d{3}[A-Z]{2})")
+#
+# Highlands (28) and Hardee (25) use none of that party and division shape.
+# Their long form, as the e-filing portal writes it in the subject, repeats
+# the court type and ends in a fixed location code:
+#   28 2026 CF 000000 CF AXMX
+# Felony is CF, misdemeanor MM, traffic CT. Traffic is written CT in some
+# places and TT in others for the same case, so in either court position CT
+# and TT are taken as the same thing. Anything else that differs between the
+# two court positions is not a case number.
+#
+# The Polk shape skips 25 and 28. A Hardee number printed in the Polk shape
+# would otherwise come back with its division cut short, which is a wrong case
+# number rather than a missing one.
+UCN_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}[A-Z]{2}\d{6}[A-Z]\d{3}[A-Z]{2})")
+HIGHLANDS_HARDEE_PATTERN = re.compile(
+    r"(?<!\d)((?:25|28)\d{4}(CF|MM|CT|TT)\d{6}(CF|MM|CT|TT)AXMX)"
+)
+TRAFFIC_COURTS = frozenset({"CT", "TT"})
+
+# Highlands and Hardee documents rarely print the long form. These are the
+# shorter forms seen in them, all for the same case as 282026CF000000CFAXMX:
+#   CF26-00000AXXS            court, 2-digit year, 5-digit sequence, division
+#   CF26-00000                the same with no division
+#   TT26-000000XXS            traffic keeps all 6 digits and has no A
+#   2026-CF-000000-XX         4-digit year, no county
+#   28-2026-CF-000000-XX      with the county
+#   2026-CF-000000-CFAXMX     long form missing its county
+# The 5-digit sequence is the 6-digit one without its leading zero.
+#
+# Only dashes are stripped here, not whitespace. These forms are short, and
+# joining them onto the next word or number on the page would let a case
+# number run into a page number and stop matching, or start matching.
+SHORT_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(CF|MM)(\d{2})(\d{5})(?!\d)(?:A(XXS|XXW))?"
+    r"|(?<![A-Z0-9])(CT|TT)(\d{2})(\d{6})(?!\d)(XXS|XXW)?"
+)
+YEAR_FIRST_PATTERN = re.compile(r"(?<!\d)(25|28)?(20\d{2})(CF|MM|CT|TT)(\d{6})(?!\d)")
+
+# Division codes that pin the county: XXS is Highlands, XXW is Hardee.
+DIVISION_COUNTY = {"XXS": "28", "XXW": "25"}
 
 logger = get_logger(__name__)
+
+
+class CaseRef(NamedTuple):
+    """A Highlands or Hardee case as named by any printed form.
+
+    county is None when the form does not say which county. court is CT for
+    traffic whether it was printed CT or TT.
+    """
+
+    county: str | None
+    year: str
+    court: str
+    sequence: str
 
 def find_ucn(document_text: str, body: str = "", subject: str = "") -> str | None:
     """Return the first UCN found, searching subject, then body, then document.
@@ -75,11 +128,25 @@ def _find_all(text: str) -> list[str]:
     """Return every UCN in the text, in order of appearance, normalized.
 
     Whitespace and dashes are stripped first, so all three printed forms
-    match. Returned values are therefore in the run-together form regardless
-    of how the document printed them.
+    match, for Polk and for Highlands and Hardee. Returned values are
+    therefore in the run-together form regardless of how the document
+    printed them.
     """
     stripped = re.sub(r"[\s-]+", "", text).upper()
-    return UCN_PATTERN.findall(stripped)
+    found = [(m.start(), m.group(1)) for m in UCN_PATTERN.finditer(stripped)]
+    for m in HIGHLANDS_HARDEE_PATTERN.finditer(stripped):
+        if _courts_agree(m.group(2), m.group(3)):
+            found.append((m.start(), m.group(1)))
+    return [ucn for _, ucn in sorted(found)]
+
+
+def _courts_agree(first: str, second: str) -> bool:
+    """Return True if the two court positions of a long form name one court.
+
+    CT and TT are interchangeable, per the Highlands and Hardee examples.
+    """
+    return first == second or {first, second} <= TRAFFIC_COURTS
+
 
 def normalize(ucn: str) -> str:
     """Strip formatting so the two printed forms compare equal.
@@ -89,3 +156,220 @@ def normalize(ucn: str) -> str:
     will not equal a full one, which is correct: they are less specific.
     """
     return ucn.replace("-", "").upper()
+
+def find_case_refs(text: str) -> list[CaseRef]:
+    """Return every Highlands or Hardee case the text names, in any form.
+
+    Distinct, in order of first appearance. Used on documents, which name the
+    case in short forms the long-form pattern cannot see.
+    """
+    if not text:
+        return []
+
+    joined = re.sub(r"\s*-\s*", "", text).upper()
+    found: list[tuple[int, CaseRef]] = []
+
+    for m in SHORT_PATTERN.finditer(joined):
+        if m.group(1):
+            court, year, sequence, division = m.group(1), m.group(2), "0" + m.group(3), m.group(4)
+        else:
+            court, year, sequence, division = m.group(5), m.group(6), m.group(7), m.group(8)
+        found.append((m.start(), CaseRef(
+            DIVISION_COUNTY.get(division), "20" + year, _court_family(court), sequence
+        )))
+
+    for m in YEAR_FIRST_PATTERN.finditer(joined):
+        found.append((m.start(), CaseRef(
+            m.group(1), m.group(2), _court_family(m.group(3)), m.group(4)
+        )))
+
+    return list(dict.fromkeys(ref for _, ref in sorted(found)))
+
+
+def case_ref(ucn: str) -> CaseRef | None:
+    """Return the CaseRef for a Highlands or Hardee long form, else None."""
+    m = HIGHLANDS_HARDEE_PATTERN.fullmatch(normalize(ucn))
+    if not m or not _courts_agree(m.group(2), m.group(3)):
+        return None
+    long_form = m.group(1)
+    return CaseRef(long_form[:2], long_form[2:6], _court_family(m.group(2)), long_form[8:14])
+
+
+def refers_to(ucn: str, ref: CaseRef) -> bool:
+    """Return True if a document's CaseRef names the same case as a long form.
+
+    A ref with no county still counts, since the document does not say
+    otherwise. One that names the other county does not.
+    """
+    own = case_ref(ucn)
+    if own is None:
+        return False
+    return own._replace(county=None) == ref._replace(county=None) and ref.county in (None, own.county)
+
+
+def to_long_form(ref: CaseRef) -> str | None:
+    """Rebuild the long form STAC searches by, or None if the county is unknown.
+
+    Traffic is written CT then TT for Highlands and CT then CT for Hardee, as
+    the Highlands and Hardee UCN write-up shows them. If STAC does not know
+    the rebuilt number, the search finds nothing and the email goes to Manual
+    Review rather than trying another spelling.
+    """
+    if ref.county is None:
+        return None
+    second = "TT" if ref.court == "CT" and ref.county == "28" else ref.court
+    return f"{ref.county}{ref.year}{ref.court}{ref.sequence}{second}AXMX"
+
+
+def _court_family(court: str) -> str:
+    """Fold TT into CT so the two spellings of traffic compare equal."""
+    return "CT" if court in TRAFFIC_COURTS else court
+
+
+def find_document_refs(text: str, document_ucns: list[str]) -> list[CaseRef]:
+    """Every Highlands or Hardee case in the text, short forms and long.
+
+    Long forms found by find_all are added too. find_case_refs keeps
+    whitespace, so a long form OCR'd with spaces inside it is only seen there.
+    """
+    long_refs = [ref for ref in map(case_ref, document_ucns) if ref]
+    return list(dict.fromkeys(find_case_refs(text) + long_refs))
+
+
+def choose_ucn(
+    subject_ucn: str | None,
+    body_ucns: list[str],
+    document_ucns: list[str],
+    document_refs: list[CaseRef] | None = None,
+) -> tuple[tuple[str, str] | None, str]:
+    """Pick the UCN to enter under, or say why none can be trusted.
+
+    Rules, agreed 1 Oct 2026:
+        email UCN and document agree        use it
+        email UCN, document has none        use the email UCN
+        no email UCN, document has one      use the document UCN
+        email UCN not in the document       conflict, Manual Review
+        no email UCN, document has several  conflict, Manual Review
+        nothing anywhere                    no UCN
+
+    "Email UCN" is the subject's. If the subject has none, the body's, but
+    only when the body names exactly one case: a full body often carries a
+    reply chain or forwarded history that mentions other cases, so a body
+    naming several is a conflict. When the subject has a UCN the body is
+    recorded but decides nothing, for the same reason.
+
+    A document that cites other cases still agrees if the email's UCN is
+    anywhere in it.
+
+    Highlands and Hardee, agreed 6 Oct 2026: same rules, but their documents
+    name the case in short forms, so agreement and counting go by
+    document_refs. One case printed several ways is one case. With no email
+    UCN, the document's one case must say its county, or there is no long
+    form to search STAC by.
+
+    Returns:
+        ((ucn, source) or None, conflict reason or "").
+    """
+    if subject_ucn:
+        email_ucn, email_source = subject_ucn, "subject"
+    elif len(body_ucns) == 1:
+        email_ucn, email_source = body_ucns[0], "body"
+    elif len(body_ucns) > 1:
+        return None, (
+            f"No UCN in the subject and the body names {len(body_ucns)} cases: "
+            f"{', '.join(body_ucns)}"
+        )
+    else:
+        email_ucn, email_source = None, ""
+
+    document_refs = document_refs or []
+
+    if email_ucn:
+        if case_ref(email_ucn):
+            named = bool(document_ucns or document_refs)
+            agrees = any(refers_to(email_ucn, ref) for ref in document_refs)
+        else:
+            named = bool(document_ucns)
+            agrees = email_ucn in document_ucns
+        if named and not agrees:
+            labels = case_labels(document_ucns, document_refs)
+            return None, f"Email names {email_ucn}, document names {', '.join(labels)}"
+        return (email_ucn, email_source), ""
+
+    others, refs = _document_cases(document_ucns, document_refs)
+    if len(others) + len(refs) > 1:
+        labels = case_labels(others, refs)
+        return None, (
+            f"No UCN on the email and the document names {len(labels)} cases: "
+            f"{', '.join(labels)}"
+        )
+
+    if others:
+        return (others[0], "document"), ""
+
+    if refs and refs[0].county:
+        return (to_long_form(refs[0]), "document"), ""
+
+    return None, ""
+
+
+def _document_cases(
+    document_ucns: list[str], document_refs: list[CaseRef]
+) -> tuple[list[str], list[CaseRef]]:
+    """Count the distinct cases a document names.
+
+    Returns:
+        (full UCNs that are not Highlands or Hardee, one CaseRef per
+        Highlands or Hardee case). Forms of one case that differ only in
+        whether they show the county merge into one; the same number shown
+        under both counties is two cases.
+
+    A short form with no county could be a Polk citation as easily as a
+    Highlands or Hardee one. When the document has a full Polk number, such
+    forms are left out, so Polk documents are counted exactly as before short
+    forms were read.
+    """
+    others = [u for u in document_ucns if case_ref(u) is None]
+
+    counties: dict[tuple[str, str, str], set[str]] = {}
+    for ref in document_refs:
+        seen = counties.setdefault((ref.year, ref.court, ref.sequence), set())
+        if ref.county:
+            seen.add(ref.county)
+
+    refs = [
+        CaseRef(county, *key)
+        for key, seen in counties.items()
+        if seen or not others
+        for county in (sorted(seen) or [None])
+    ]
+    return others, refs
+
+
+def case_labels(document_ucns: list[str], document_refs: list[CaseRef]) -> list[str]:
+    """Show a document's cases in the CSV and in conflict reasons, once each.
+
+    A long form is both a full UCN and a CaseRef, so without the dedupe it
+    would be listed twice.
+    """
+    labels = [
+        to_long_form(ref) or f"{ref.year}{ref.court}{ref.sequence} (no county)"
+        for ref in document_refs
+    ]
+    return list(dict.fromkeys(document_ucns + labels))
+
+
+def document_labels(
+    document_ucns: list[str], document_refs: list[CaseRef], chosen_ucn: str | None
+) -> list[str]:
+    """What the CSV's ucn_document column and the log show for a document.
+
+    Short forms with no county are left out when the chosen case is Polk:
+    they are the document citing Polk cases in short form, which Polk's
+    rules ignore, and listing them only made Polk rows harder to read. Kept
+    for Highlands and Hardee, and when no case was chosen, since there they
+    explain the decision.
+    """
+    if chosen_ucn and case_ref(chosen_ucn) is None:
+        document_refs = [ref for ref in document_refs if ref.county]
+    return case_labels(document_ucns, document_refs)
