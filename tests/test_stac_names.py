@@ -1,4 +1,6 @@
-from stac import name_in_text
+from pathlib import Path
+
+from stac import document_label, name_in_text
 
 # Made-up names only.
 STAC = "DOE, JOHN A (ALERT)"
@@ -46,3 +48,17 @@ def test_empty_text_or_one_word_stac_name_fails():
 def test_multi_word_surname_needs_every_part():
     assert name_in_text("DE LA ROSA, MARIA", "Maria De La Rosa")
     assert not name_in_text("DE LA ROSA, MARIA", "Maria Rosa")
+
+
+def test_document_label_uses_numbers_not_the_filename() -> None:
+    """The filename can carry the defendant's name, so only the numbers are logged."""
+    label = document_label(Path("C:/temp/stac_x/0003_2_Doe John Notice.pdf"))
+
+    assert label == "email 3 attachment 2"
+    assert "Doe" not in label
+
+
+def test_document_label_falls_back_without_leaking() -> None:
+    """A file not named by main.py is never logged by name."""
+    assert document_label(Path("Doe John Notice.pdf")) == "a document"
+    assert document_label(Path("abc_1_Doe.pdf")) == "a document"

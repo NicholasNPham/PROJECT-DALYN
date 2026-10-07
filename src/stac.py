@@ -585,7 +585,7 @@ class StacSession:
                 "to this instance."
             ) from error
 
-        logger.info("Signed in to STAC as %s", self._username)
+        logger.info("Signed in to STAC")
         self._pause("signed in")
 
     def close(self) -> None:
@@ -872,7 +872,7 @@ class StacSession:
             SaveMayHaveHappened: Save was clicked and never confirmed.
             SystemProblem: Anything else in STAC misbehaved.
         """
-        names = ", ".join(path.name for path in paths)
+        names = ", ".join(document_label(path) for path in paths)
 
         if not self.upload_enabled:
             logger.info(
@@ -1705,6 +1705,20 @@ def _xpath_literal(value: str) -> str:
     return f"concat({joined})"
 
 
+def document_label(path: Path) -> str:
+    """Name an uploaded file by its email and position, never its filename.
+
+    main.py writes each file as NNNN_P_<original name>, the email number and
+    the attachment's position, and senders name files after the defendant.
+    Only the numbers go into log lines and error messages. A file not named
+    that way is just "a document", rather than risking the name leaking.
+    """
+    parts = path.name.split("_", 2)
+    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+        return f"email {int(parts[0])} attachment {int(parts[1])}"
+    return "a document"
+
+
 def group_by_type(documents: list) -> list:
     """Group an email's documents by Type/Subtype, keeping their order.
 
@@ -1876,7 +1890,7 @@ class StacRunner:
     def _already_in(entered: list) -> str:
         """Plain sentence naming what is already filed, for a person to read."""
         filed = ", ".join(
-            f"{path.name} as {document_type}/{subtype}"
+            f"{document_label(path)} as {document_type}/{subtype}"
             for (document_type, subtype), paths in entered
             for path in paths
         )

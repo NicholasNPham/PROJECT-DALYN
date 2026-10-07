@@ -153,12 +153,16 @@ def _is_pdf(data: bytes) -> bool:
     return PDF_MAGIC in data[:PDF_HEADER_WINDOW]
 
 
-def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
+def _read_and_classify(pdf_bytes: bytes, label: str, rules: list):
     """Extract text, classify, and find the document UCN. Mirrors review_batch.py.
 
     If the embedded text matched no rule at all, retry once through forced
     OCR and keep that result. Safety-net hits are not retried, because the
     batch 10 numbers were measured without that.
+
+    label names the attachment in OCR's log lines and errors. It is a
+    position such as "attachment 1 of 2", never the filename: senders name
+    files after the defendant.
 
     Document UCNs are collected from both the embedded text and, if it ran,
     the OCR retry, since forced OCR reads only the first FORCE_OCR_PAGE_LIMIT
@@ -174,7 +178,7 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
         DocumentProblem: If the first extraction cannot produce usable text.
         SystemProblem: If Tesseract is unavailable.
     """
-    text, source = ocr.extract_text(pdf_bytes, filename)
+    text, source = ocr.extract_text(pdf_bytes, label)
     result = classifier.classify(rules, text)
     document_ucns = ucn.find_all(text)
     document_refs = ucn.find_document_refs(text, document_ucns)
@@ -183,9 +187,9 @@ def _read_and_classify(pdf_bytes: bytes, filename: str, rules: list):
         return text, source, result, False, document_ucns, document_refs
 
     try:
-        text, source = ocr.extract_text(pdf_bytes, filename, force_ocr=True)
+        text, source = ocr.extract_text(pdf_bytes, label, force_ocr=True)
     except DocumentProblem as error:
-        logger.info("%s: OCR retry failed, keeping embedded result (%s)", filename, error)
+        logger.info("%s: OCR retry failed, keeping embedded result (%s)", label, error)
         return text, source, result, True, document_ucns, document_refs
 
     result = classifier.classify(rules, text)
@@ -207,8 +211,12 @@ def _process_attachment(
     base_row: dict,
     subject_ucn: str | None,
     body_ucns: list[str],
+    label: str,
 ) -> dict:
     """Build one CSV row for one attachment. DocumentProblems become rows.
+
+    label is the attachment's position, used in place of its filename
+    anywhere the attachment is logged.
 
     SystemProblem is not caught here. A missing Tesseract is not a fact about
     this attachment and must stop the run.
@@ -247,7 +255,7 @@ def _process_attachment(
 
     try:
         text, source, result, retried, document_ucns, document_refs = _read_and_classify(
-            data, name, rules
+            data, label, rules
         )
     except DocumentProblem as error:
         return _finish(row, Outcome.UNREADABLE, f"Could not read the PDF: {error}")
@@ -408,16 +416,17 @@ def _process_message(
         )
         return [_finish(row, Outcome.NO_FILES, "No file attachments; item attachments not read yet")]
 
+    labels = [f"attachment {position} of {len(attachments)}" for position in range(1, len(attachments) + 1)]
     rows = [
-        _process_attachment(attachment, rules, base_row, subject_ucn, body_ucns)
-        for attachment in attachments
+        _process_attachment(attachment, rules, base_row, subject_ucn, body_ucns, label)
+        for attachment, label in zip(attachments, labels)
     ]
 
-    for row in rows:
+    for row, label in zip(rows, labels):
         logger.info(
             "%s | %s | %s %s/%s | ucn %s (from %s) | subject %s | body %s | document %s",
             received,
-            row["attachment_name"],
+            label,
             row["outcome"],
             row["classified_type"] or "-",
             row["classified_subtype"] or "-",
