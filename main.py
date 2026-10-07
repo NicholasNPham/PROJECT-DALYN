@@ -38,7 +38,7 @@ from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProbl
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
-from tagging import tag_email  # noqa: E402
+from tagging import mark_processing, tag_email  # noqa: E402
 from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
@@ -703,6 +703,9 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                         email_number,
                         message.get("receivedDateTime"),
                     )
+                    if actions["tag_enabled"]:
+                        mark_processing(client, mailbox, message, email_number)
+
                     email_rows = _process_message(
                         client, mailbox, message, rules, source_folder_id
                     )

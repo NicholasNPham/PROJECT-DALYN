@@ -45,8 +45,8 @@ def categories_for(rows: list[dict]) -> list[str]:
     An uploaded email gets the tag for how far STAC got, plus NO_RULE if any
     attachment went in under the review pair. A Manual Review email gets one
     tag per distinct reason, STAC's first: "may be saved" is the one a person
-    must act on before anything else. A GONE email gets none, since it is no
-    longer in the folder to tag.
+    must act on before anything else. A GONE email gets none: someone else
+    has it now, so tag_email clears DALYN's tags off it instead.
 
     Raises:
         ValueError: If an uploaded email has no STAC result. That is a bug in
@@ -82,16 +82,43 @@ def merge_categories(existing: list[str], dalyn_tags: list[str]) -> list[str]:
     return [category for category in existing if not ReviewTag.is_dalyn(category)] + dalyn_tags
 
 
-def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]) -> bool:
-    """Put this email's DALYN categories on it in Outlook.
+def mark_processing(client: GraphClient, mailbox: str, message: dict, email_number: int) -> None:
+    """Tag the email Processing, before anything else is done with it.
 
-    Called after STAC, so the tag says what actually happened. Skips the
-    write when the categories would not change, which is the normal case on
-    a dry run that re-reads the same mail every pass.
+    Updates message["categories"] to what was written, so tag_email later
+    compares against the email as it now is and replaces Processing with
+    the result.
+
+    An email that vanished between listing and now is left for
+    process_message to find GONE, which it will, so this just logs it.
+
+    Raises:
+        SystemProblem: Any Graph failure other than the email being gone.
+            Not caught: an email DALYN cannot mark is one it could not mark
+            as done either.
+    """
+    merged = merge_categories(message.get("categories") or [], [ReviewTag.PROCESSING])
+
+    try:
+        client.set_categories(mailbox, message["id"], merged)
+    except MessageGone as error:
+        logger.info("Email %s: not marked Processing, it is gone (%s)", email_number, error)
+        return
+
+    message["categories"] = merged
+
+
+def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]) -> bool:
+    """Replace the email's DALYN categories with the result, in Outlook.
+
+    Called after STAC, so the tag says what actually happened. A GONE email
+    has its DALYN tags removed rather than left alone, so the Processing tag
+    does not follow it into whatever folder someone moved it to. Skips the
+    write when the categories would not change.
 
     Returns:
-        True when the email was tagged, False when there was nothing to do or
-        it disappeared first.
+        True when the email's categories were changed, False when there was
+        nothing to do or it disappeared first.
 
     Raises:
         SystemProblem: Any Graph failure other than the email being gone.
@@ -99,9 +126,6 @@ def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]
             filed but could not be tagged would be filed again next pass.
     """
     tags = categories_for(rows)
-    if not tags:
-        return False
-
     existing = message.get("categories") or []
     merged = merge_categories(existing, tags)
     if merged == existing:
@@ -115,5 +139,5 @@ def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]
 
     # Only DALYN's own tags are logged. Staff categories are free text and
     # could name a party.
-    logger.info("Email %s: tagged %s", rows[0]["email_number"], ", ".join(tags))
+    logger.info("Email %s: tagged %s", rows[0]["email_number"], ", ".join(tags) or "(DALYN tags cleared)")
     return True

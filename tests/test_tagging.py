@@ -4,7 +4,7 @@ import pytest
 
 from exceptions import MessageGone, SystemProblem
 from models import EmailDecision, Outcome, ReviewTag, StacResult
-from tagging import categories_for, merge_categories, tag_email
+from tagging import categories_for, mark_processing, merge_categories, tag_email
 
 
 def _row(decision: str, outcome: str, stac_result: str = "") -> dict:
@@ -184,3 +184,55 @@ def test_tag_email_lets_graph_failure_stop_the_pass() -> None:
 
     with pytest.raises(SystemProblem):
         tag_email(client, "box@example.com", message, [_row(EmailDecision.MANUAL_REVIEW, Outcome.NO_UCN)])
+
+
+def test_gone_email_has_processing_tag_cleared() -> None:
+    """Moved away mid-pass: Processing must not follow it to its new folder."""
+    client = FakeClient()
+    message = {"id": "message-1", "categories": ["Staff category", ReviewTag.PROCESSING]}
+
+    assert tag_email(client, "box@example.com", message, [_row(EmailDecision.GONE, Outcome.GONE)]) is True
+    assert client.calls == [("box@example.com", "message-1", ["Staff category"])]
+
+
+# mark_processing
+
+
+def test_mark_processing_replaces_old_dalyn_tags_and_keeps_staff_ones() -> None:
+    """A re-read email shows Processing, not last pass's result, while it is worked on."""
+    client = FakeClient()
+    message = {"id": "message-1", "categories": ["Staff category", ReviewTag.NO_UCN]}
+
+    mark_processing(client, "box@example.com", message, 1)
+
+    assert client.calls == [("box@example.com", "message-1", ["Staff category", ReviewTag.PROCESSING])]
+    assert message["categories"] == ["Staff category", ReviewTag.PROCESSING]
+
+
+def test_result_tag_replaces_processing() -> None:
+    """The end-of-email write swaps Processing for the result."""
+    client = FakeClient()
+    message = {"id": "message-1", "categories": []}
+    mark_processing(client, "box@example.com", message, 1)
+
+    tag_email(client, "box@example.com", message, [_row(EmailDecision.MANUAL_REVIEW, Outcome.NO_UCN)])
+
+    assert client.calls[-1] == ("box@example.com", "message-1", [ReviewTag.NO_UCN])
+
+
+def test_mark_processing_on_vanished_email_leaves_message_unchanged() -> None:
+    """Gone before it was marked: logged, and the folder check finds it GONE."""
+    client = FakeClient(error=MessageGone("404"))
+    message = {"id": "message-1", "categories": ["Staff category"]}
+
+    mark_processing(client, "box@example.com", message, 1)
+
+    assert message["categories"] == ["Staff category"]
+
+
+def test_mark_processing_lets_graph_failure_stop_the_pass() -> None:
+    """An email DALYN cannot mark is one it could not mark as done either."""
+    client = FakeClient(error=SystemProblem("Graph PATCH failed with 500"))
+
+    with pytest.raises(SystemProblem):
+        mark_processing(client, "box@example.com", {"id": "message-1"}, 1)

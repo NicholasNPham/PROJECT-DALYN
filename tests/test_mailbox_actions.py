@@ -101,7 +101,7 @@ def test_every_tag_carries_the_prefix() -> None:
     """The prefix is how DALYN recognizes its own categories."""
     tags = ReviewTag.all()
 
-    assert len(tags) == 11
+    assert len(tags) == 12
     assert all(tag.startswith(ReviewTag.PREFIX) and tag != ReviewTag.PREFIX for tag in tags)
     assert len(set(tags)) == len(tags)
 

@@ -30,6 +30,12 @@ class ReviewTag:
     # Used only when DALYN creates a category in a mailbox's master list.
     COLOR = "preset0"
 
+    # Put on the moment DALYN picks an email up, before anything is
+    # downloaded, and replaced by the result tag when it is done. Staff see
+    # straight away which email DALYN is on, and an email still carrying it
+    # on a later pass was being worked on when a run died.
+    PROCESSING = "DALYN: Processing"
+
     # Uploaded. Which one depends on how far the stac switches let it go, so
     # a tag never says Filed when Save was never pressed.
     FILED = "DALYN: Filed"
