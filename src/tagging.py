@@ -31,6 +31,7 @@ REVIEW_TAGS = {
     Outcome.NO_UCN: ReviewTag.NO_UCN,
     Outcome.UCN_CONFLICT: ReviewTag.UCN_CONFLICT,
     Outcome.UCN_OTHER_COUNTY: ReviewTag.OTHER_COUNTY,
+    Outcome.INTERRUPTED: ReviewTag.INTERRUPTED,
 }
 
 STAC_FAILURE_TAGS = {
@@ -80,6 +81,16 @@ def merge_categories(existing: list[str], dalyn_tags: list[str]) -> list[str]:
     reaches a different result does not leave both on the email.
     """
     return [category for category in existing if not ReviewTag.is_dalyn(category)] + dalyn_tags
+
+
+def was_interrupted(message: dict) -> bool:
+    """True when the email still carries Processing from an earlier run.
+
+    Read from the categories as listed, before this pass marks the email
+    itself. DALYN replaces Processing at the end of every email, so finding
+    it here means a run stopped partway through this one.
+    """
+    return ReviewTag.PROCESSING in (message.get("categories") or [])
 
 
 def mark_processing(client: GraphClient, mailbox: str, message: dict, email_number: int) -> None:

@@ -4,7 +4,7 @@ import pytest
 
 from exceptions import MessageGone, SystemProblem
 from models import EmailDecision, Outcome, ReviewTag, StacResult
-from tagging import categories_for, mark_processing, merge_categories, tag_email
+from tagging import categories_for, mark_processing, merge_categories, tag_email, was_interrupted
 
 
 def _row(decision: str, outcome: str, stac_result: str = "") -> dict:
@@ -76,6 +76,7 @@ def test_uploaded_email_without_stac_result_is_a_bug() -> None:
         (Outcome.NO_UCN, ReviewTag.NO_UCN),
         (Outcome.UCN_CONFLICT, ReviewTag.UCN_CONFLICT),
         (Outcome.UCN_OTHER_COUNTY, ReviewTag.OTHER_COUNTY),
+        (Outcome.INTERRUPTED, ReviewTag.INTERRUPTED),
     ],
 )
 def test_manual_review_reason_maps_to_its_tag(outcome: str, tag: str) -> None:
@@ -236,3 +237,19 @@ def test_mark_processing_lets_graph_failure_stop_the_pass() -> None:
 
     with pytest.raises(SystemProblem):
         mark_processing(client, "box@example.com", {"id": "message-1"}, 1)
+
+
+# was_interrupted
+
+
+def test_leftover_processing_tag_means_interrupted() -> None:
+    """Processing is always replaced at the end, so finding it means a run died."""
+    assert was_interrupted({"categories": ["Staff category", ReviewTag.PROCESSING]})
+
+
+def test_finished_or_untouched_email_is_not_interrupted() -> None:
+    """A result tag, staff tags only, or no categories at all are all fine."""
+    assert not was_interrupted({"categories": [ReviewTag.FILED]})
+    assert not was_interrupted({"categories": ["Staff category"]})
+    assert not was_interrupted({"categories": []})
+    assert not was_interrupted({})

@@ -38,7 +38,7 @@ from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProbl
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
-from tagging import mark_processing, tag_email  # noqa: E402
+from tagging import mark_processing, tag_email, was_interrupted  # noqa: E402
 from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
@@ -323,7 +323,7 @@ def _process_attachment(
 
 
 def _email_row(base_row: dict, subject_ucn: str | None, body_ucns: list[str]) -> dict:
-    """One row standing for a whole email, for NO_FILES and GONE."""
+    """One row standing for a whole email, for NO_FILES, GONE and INTERRUPTED."""
     row = dict.fromkeys(CSV_COLUMNS, "")
     row.update(base_row)
     row["ucn_subject"] = subject_ucn or ""
@@ -332,6 +332,23 @@ def _email_row(base_row: dict, subject_ucn: str | None, body_ucns: list[str]) ->
     if chosen:
         row["ucn"], row["ucn_source"] = chosen
     return row
+
+
+def _interrupted_rows(mailbox: str, message: dict) -> list[dict]:
+    """The single INTERRUPTED row for an email held without being read.
+
+    The case number comes from the subject and body only, which are already
+    in hand. It is what the person needs to look the case up in STAC, and
+    reading the attachments would mean doing the very work being held back.
+    """
+    subject, body_text = _email_text(message)
+    base_row = {
+        "mailbox": mailbox,
+        "message_id": message["id"],
+        "received_utc": message.get("receivedDateTime", ""),
+    }
+    row = _email_row(base_row, ucn.find_ucn("", subject=subject), ucn.find_all(body_text))
+    return [_finish(row, Outcome.INTERRUPTED, "Still tagged Processing from an earlier run")]
 
 
 def _email_text(message: dict) -> tuple[str, str]:
@@ -442,6 +459,12 @@ def _decide_email(rows: list[dict], email_number: int, keep_decision: bool = Fal
         email_type, decision, reason = EmailType.NONE, EmailDecision.GONE, "Left the folder before it was read"
     elif outcomes == [Outcome.NO_FILES]:
         email_type, decision, reason = EmailType.NONE, EmailDecision.MANUAL_REVIEW, "No file attachments"
+    elif outcomes == [Outcome.INTERRUPTED]:
+        email_type, decision, reason = (
+            EmailType.NONE,
+            EmailDecision.MANUAL_REVIEW,
+            "Interrupted on an earlier run with Save on; check STAC, then clear the tag",
+        )
     else:
         email_type = EmailType.SINGLE if len(rows) == 1 else EmailType.MULTIPLE
         blocking = [row for row in rows if row["outcome"] not in ENTERABLE]
@@ -646,6 +669,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     work_dir = config["paths"]["temp"] / f"stac_{stamp}"
 
     actions = config["mailbox_actions"]
+    save_enabled = config["stac"].get("save_enabled", False)
     tagged = 0
     skipped_tagged = 0
 
@@ -688,7 +712,12 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                     client.ensure_categories(mailbox, ReviewTag.all(), ReviewTag.COLOR)
 
                 for position, message in enumerate(messages, start=1):
-                    if actions["skip_tagged"] and any(
+                    # Checked before skip_tagged, because Processing is a
+                    # DALYN tag too: with skipping on, an interrupted email
+                    # would otherwise be skipped forever without anyone told.
+                    interrupted = actions["tag_enabled"] and was_interrupted(message)
+
+                    if not interrupted and actions["skip_tagged"] and any(
                         ReviewTag.is_dalyn(category) for category in message.get("categories") or []
                     ):
                         skipped_tagged += 1
@@ -703,6 +732,25 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                         email_number,
                         message.get("receivedDateTime"),
                     )
+
+                    if interrupted and save_enabled:
+                        # The run that died may have pressed Save. Doing it
+                        # again could file the document twice, so a person
+                        # checks STAC first. Nothing is downloaded.
+                        email_rows = _interrupted_rows(mailbox, message)
+                        logger.warning(_decide_email(email_rows, email_number))
+                        rows.extend(email_rows)
+                        if tag_email(client, mailbox, message, email_rows):
+                            tagged += 1
+                        continue
+
+                    if interrupted:
+                        logger.warning(
+                            "Email %s was interrupted on an earlier run. Save is off, "
+                            "so nothing can have been filed; handling it again.",
+                            email_number,
+                        )
+
                     if actions["tag_enabled"]:
                         mark_processing(client, mailbox, message, email_number)
 

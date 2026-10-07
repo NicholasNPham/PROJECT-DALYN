@@ -36,6 +36,11 @@ class ReviewTag:
     # on a later pass was being worked on when a run died.
     PROCESSING = "DALYN: Processing"
 
+    # Found still carrying PROCESSING on a later pass while Save is on: a run
+    # died partway through it, maybe after Save. Held for a person, who
+    # checks STAC and clears the tag to let DALYN take it again.
+    INTERRUPTED = "DALYN: Interrupted"
+
     # Uploaded. Which one depends on how far the stac switches let it go, so
     # a tag never says Filed when Save was never pressed.
     FILED = "DALYN: Filed"
@@ -99,6 +104,9 @@ class Outcome:
     skipped without reading. Nobody needs to act on it; whoever moved it
     has it.
 
+    INTERRUPTED is email-level too: an earlier run died partway through this
+    email with Save on, so it is held for a person without being read.
+
     classified_type/subtype are filled whenever the classifier produced them,
     even if NO_UCN wins, so every readable PDF gets its classification checked.
     """
@@ -113,6 +121,7 @@ class Outcome:
     TOO_LARGE = "TOO_LARGE"
     NO_FILES = "NO_FILES"
     GONE = "GONE"
+    INTERRUPTED = "INTERRUPTED"
 
 
 class EmailDecision:
