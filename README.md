@@ -1,110 +1,102 @@
-﻿# Project-Dalyn----Email-to-STAC-Document-Processing-Pipeline
+# DALYN: email to case-file document intake
 
-Automating document intake pipeline for the State Attorney's Office. Monitors two Outlook inboxes, OCRs incoming PDF attachments, classifies them against a phrase-scoring Excel sheet, and enters the results into the STAC web application via Selenium.
+## 1. What problem it solves
 
----
+A prosecutor's office receives a steady stream of court filings by email, and
+each one has to be identified and filed on the right case by hand. DALYN does
+that filing automatically and hands a person only the emails it cannot be
+sure about.
 
-## What It Does
+## 2. How it works
 
-1. Monitors `email1` and `email2` for incoming emails
-2. Saves PDF attachments to a temp folder on disk
-3. OCRs each PDF using Tesseract to extract raw text
-4. Classifies the document by scoring phrases against an Excel sheet to determine Type and Subtype
-5. Logs into STAC and enters the document data automatically
-6. Moves processed emails to a completed folder, or a manual review folder if classification fails
+1. DALYN checks the case mailboxes for new emails with attachments.
+2. It reads each PDF, using OCR when the document is a scan.
+3. It works out what kind of document it is from a spreadsheet of rules that
+   staff maintain themselves, with no code changes.
+4. It finds the case number in the email or document, and checks that they
+   agree.
+5. It opens the case in the case management system and uploads the document
+   under the right type.
+6. Anything uncertain, such as a missing or conflicting case number, an
+   unreadable scan, or a defendant name that does not match, goes to a person
+   instead. DALYN never guesses.
+7. Each email is labeled in Outlook with what happened, so staff can see the
+   result at a glance.
 
----
+It runs in stages, each switched on deliberately: read only, upload without
+saving, then save.
 
-## Project Structure
+## 3. Tech used
 
-```
-ProjectDalyn/
-├── config/
-│   └── config.yaml          # Runtime configuration (accounts, paths, URLs, intervals)
-├── data/                    # Persistent data storage
-├── logs/                    # Log output
-├── temp/                    # Temporary PDF storage during processing
-├── src/
-│   ├── __init__.py
-│   ├── email_monitor.py     # Connects to Outlook via win32com, pulls unread emails
-│   ├── ocr.py               # Extracts text from PDFs using PyMuPDF and Tesseract
-│   ├── classifier.py        # Scores extracted text against Excel phrase sheet
-│   ├── stac.py              # Selenium automation for STAC web application
-│   ├── file_manager.py      # Handles temp file creation, cleanup, and archiving
-│   ├── logger.py            # Logging setup and helpers
-│   ├── models.py            # Dataclasses: Email, PDF, ClassificationResult, Config
-│   └── exceptions.py        # Custom exception classes
-├── tests/
-│   ├── __init__.py
-│   ├── test_classifier.py
-│   └── test_ocr.py
-├── .gitignore
-├── key.py                   # Secrets and credentials (not committed to git)
-├── key_template.py          # Template for key.py
-├── main.py                  # Pipeline entry point
-└── README.md
-```
-
----
-
-## Stack
-
-| Purpose | Library |
+| Purpose | Tool |
 |---|---|
-| Outlook email access | `win32com` |
-| PDF text extraction | `PyMuPDF` |
-| OCR on scanned PDFs | `Tesseract` via `pytesseract` |
-| Excel phrase scoring | `openpyxl` |
-| STAC web automation | `Selenium` |
-| Configuration | `PyYAML` |
-| Testing | `pytest` |
+| Language | Python 3.14 |
+| Reading and labeling mail | Microsoft Graph API (`msal`, `requests`) |
+| PDF text | `pypdf`, `PyMuPDF` |
+| OCR for scans | Tesseract via `pytesseract`, `opencv` for cleanup |
+| Rules spreadsheet | `openpyxl` |
+| Case management web app | `selenium` |
+| Secrets | Windows Credential Manager via `keyring` |
+| Config | `PyYAML`, validated at startup with no defaults |
+| Tests | `pytest`, 101 tests, no network or live systems |
 
----
+Design choices worth knowing:
+- **All or nothing per email.** Either every attachment is filed or none are,
+  so a person never has to work out what DALYN already did.
+- **Two kinds of error.** A problem with one document sends that email to
+  review and the run continues. A problem with DALYN or a service stops the
+  run.
+- **Allowlists in code.** Graph calls are limited to the enabled mailboxes
+  and the configured folder, and the test-instance flag must match the URL.
+- **No personal data in output.** Logs and the review CSV hold case numbers
+  and outcomes only, never names, subjects or email bodies.
 
-## Configuration
+## 4. Results
 
-Copy `key_template.py` to `key.py` and fill in credentials. Copy `config.yaml` and fill in your values:
+From a dry run on 6 Oct 2026 against the test case management system,
+stopping before Save:
 
-```yaml
-accounts:
-  - 'email1'
-  - 'email2'
+| Measure | Result |
+|---|---|
+| Emails handled end to end with no person | 18 of 25 (72%) |
+| Emails sent to review | 7 of 25 (28%): 3 forwarded with no file, 2 cases missing from the test system, 1 non-PDF, 1 defendant mismatch |
+| Attachments matched to a specific rule | 30 of 39 (77%) |
+| Attachments with no rule, filed for review on the right case | 8 of 39 (21%) |
+| Case number problems | 0 of 39 |
+| Uploads that reached Save | 35 of 38 (92%), all 3 failures expected |
+| New county formats: case number read correctly | 4 of 4 |
 
-outlook_profile: "Outlook"
-folder_completed: "Completed"
-folder_manual_review: "Manual Review"
-excel_path: "C:/path/to/DALYN.xlsx"
-log_path: "C:/path/to/ProjectDalyn/logs"
-temp_folder: "C:/path/to/ProjectDalyn/temp"
-polling_interval_minutes: 30
-stac_url: "https://your-stac-url.com"
-outlook_retry_attempts: 3
-outlook_retry_delay_seconds: 5
-email_move_error_color: "Red"
+## 5. How to run it
+
+**Setup**
+1. Install Python 3.14 and run `pip install -r requirements.txt`.
+2. Install the Tesseract binary and put it on PATH, or set `paths.tesseract`.
+3. Copy `config/config.example.yaml` to `config/config.yaml` and fill it in.
+4. Run `python set_credentials.py` to store the Graph secret and the
+   case management login in Windows Credential Manager.
+
+The Graph app registration needs `Mail.ReadWrite` and `MailboxSettings.ReadWrite`.
+
+**Usage**
+```
+python main.py --limit 5     # one pass over at most 5 emails
+python main.py --watch 120   # a pass every 120 seconds until Ctrl+C
+python check_types.py        # check the rules sheet against the system's type list
+python -m pytest             # tests
 ```
 
----
+**Safety switches** in `config.yaml`, each changed one at a time:
 
-## Running Tests
+| Setting | Controls |
+|---|---|
+| `mailboxes[].enabled` | Which mailboxes are reachable at all |
+| `stac.is_test_instance` | Must match the URL, or DALYN refuses to start |
+| `stac.upload_enabled` | Upload, stopping before Save |
+| `stac.save_enabled` | Press Save |
+| `mailbox_actions.tag_enabled` | Label handled emails in Outlook |
+| `mailbox_actions.skip_tagged` | Skip emails already labeled |
+| `mailbox_actions.move_enabled` | Not built yet; must be false |
 
-```
-pytest tests/
-```
-
----
-
-## Status
-
-| Module | Status |
-|---|--|
-| `models.py` | Complete |
-| `email_monitor.py` | Complete |
-| `classifier.py` | Complete |
-| `test_classifier.py` | Complete |
-| `ocr.py` | Not started |
-| `test_ocr.py` | Not started |
-| `stac.py` | Not started |
-| `file_manager.py` | Not started |
-| `logger.py` | Not started |
-| `exceptions.py` | Not started |
-| `main.py` | Not started |
+**Status:** reading, classification, case numbers and upload are done and
+tested to the Save step. Next are skipping labeled mail, moving handled mail,
+scheduled unattended runs, and the switch to live systems.
