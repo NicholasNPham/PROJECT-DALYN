@@ -27,6 +27,7 @@ REQUIRED_KEYS = (
     "max_messages",
     "newest_first",
     "stac",
+    "mailbox_actions",
     "paths",
 )
 REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id")
@@ -42,6 +43,9 @@ MOVED_TO_CREDENTIAL_MANAGER = {
 }
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 MAILBOX_KEYS = ("address", "enabled")
+# What DALYN may do to a message once it has handled it. All three are
+# required, with no defaults, because each one writes to a real mailbox.
+MAILBOX_ACTION_KEYS = ("tag_enabled", "move_enabled", "skip_tagged")
 
 # A url is treated as a test instance only if one of these appears in it.
 # Deliberately crude: the point is that a plain production url cannot be
@@ -105,7 +109,8 @@ def load_config(config_path: Path | None = None, with_credentials: bool = True) 
     stac = config["stac"]
     logger.info(
         "Config loaded from %s (dry_run=%s, mailboxes=%s of %s enabled: %s, "
-        "stac=%s, test=%s, upload=%s, save=%s, secrets=%s)",
+        "stac=%s, test=%s, upload=%s, save=%s, tag=%s, move=%s, skip_tagged=%s, "
+        "secrets=%s)",
         path,
         config["dry_run"],
         len(config["enabled_mailboxes"]),
@@ -115,6 +120,9 @@ def load_config(config_path: Path | None = None, with_credentials: bool = True) 
         stac.get("is_test_instance", True),
         stac.get("upload_enabled", False),
         stac.get("save_enabled", False),
+        config["mailbox_actions"]["tag_enabled"],
+        config["mailbox_actions"]["move_enabled"],
+        config["mailbox_actions"]["skip_tagged"],
         "Credential Manager" if with_credentials else "not loaded",
     )
 
@@ -204,6 +212,7 @@ def _validate(config: dict, path: Path) -> None:
         raise SystemProblem("Config key 'stac.action_pause' must be 0 or more seconds.")
 
     _validate_review_pair(stac)
+    _validate_mailbox_actions(config["mailbox_actions"])
 
     paths = config["paths"]
     if not isinstance(paths, dict):
@@ -212,6 +221,35 @@ def _validate(config: dict, path: Path) -> None:
     missing_paths = [key for key in PATH_KEYS if not paths.get(key)]
     if missing_paths:
         raise SystemProblem(f"Config 'paths' is missing: {', '.join(missing_paths)}")
+
+
+def _validate_mailbox_actions(actions: dict) -> None:
+    """Check the tag, move and skip switches before anything touches a mailbox.
+
+    move_enabled is refused while true because moving is not built yet. A
+    switch that is accepted but does nothing would let someone believe mail
+    is being moved out of the Inbox when it is not.
+
+    Raises:
+        SystemProblem: If the section is not a mapping, a switch is missing or
+            not a boolean, or move_enabled is true.
+    """
+    if not isinstance(actions, dict):
+        raise SystemProblem("Config key 'mailbox_actions' must be a mapping.")
+
+    missing = [key for key in MAILBOX_ACTION_KEYS if key not in actions]
+    if missing:
+        raise SystemProblem(f"Config 'mailbox_actions' is missing: {', '.join(missing)}")
+
+    for key in MAILBOX_ACTION_KEYS:
+        if not isinstance(actions[key], bool):
+            raise SystemProblem(f"Config key 'mailbox_actions.{key}' must be true or false.")
+
+    if actions["move_enabled"]:
+        raise SystemProblem(
+            "Config has mailbox_actions.move_enabled true, but this build cannot "
+            "move mail yet. Set it to false."
+        )
 
 
 def _refuse_stored_secrets(config: dict, path: Path) -> None:

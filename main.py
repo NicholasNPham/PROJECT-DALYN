@@ -1,8 +1,9 @@
 """DALYN entry point.
 
-First iteration: one dry-run pass over Deleted Items of the configured
-mailboxes. Reads, OCRs, classifies, logs, exits. Enters nothing into STAC,
-tags nothing, moves nothing.
+One dry-run pass over Deleted Items of the configured mailboxes. Reads, OCRs,
+classifies, takes each email as far into STAC as the stac switches allow, and
+logs. With mailbox_actions.tag_enabled it also puts a red "DALYN: ..." Outlook
+category on each email naming what happened. It moves nothing.
 
 Two outputs per run:
     logs/dalyn.log                   what happened, for Nick
@@ -36,6 +37,8 @@ from config_loader import load_config  # noqa: E402
 from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProblem  # noqa: E402
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
+from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
+from tagging import tag_email  # noqa: E402
 from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
@@ -119,77 +122,10 @@ def _apply_review_pair(config: dict) -> None:
 MAX_PDF_BYTES = 25 * 1024 * 1024
 
 
-class Outcome:
-    """What production DALYN would have done with one attachment.
-
-    Precedence, highest first. An attachment gets exactly one outcome:
-        TOO_LARGE, NON_PDF, UNREADABLE   no text, nothing to classify
-        NO_UCN                           nowhere to enter it, even if classified
-        UCN_OTHER_COUNTY                 the case number is not Polk, Highlands
-                                         or Hardee
-        UCN_CONFLICT                     the email and the document name different
-                                         cases, or a document with no email UCN
-                                         names several
-        PLS_RVW                          no rule matched, but it has a usable case
-                                         number, so it is entered under PLS/RVW
-                                         for a person to sort out inside STAC
-        WOULD_ENTER                      classified and a UCN
-
-    GONE is email-level, like NO_FILES: the email left the source folder
-    after it was listed (moved, deleted or purged by a person), so it was
-    skipped without reading. Nobody needs to act on it; whoever moved it
-    has it.
-
-    classified_type/subtype are filled whenever the classifier produced them,
-    even if NO_UCN wins, so every readable PDF gets its classification checked.
-    """
-
-    WOULD_ENTER = "WOULD_ENTER"
-    NO_UCN = "NO_UCN"
-    UCN_CONFLICT = "UCN_CONFLICT"
-    UCN_OTHER_COUNTY = "UCN_OTHER_COUNTY"
-    PLS_RVW = "PLS_RVW"
-    UNREADABLE = "UNREADABLE"
-    NON_PDF = "NON_PDF"
-    TOO_LARGE = "TOO_LARGE"
-    NO_FILES = "NO_FILES"
-    GONE = "GONE"
-
-
-class EmailDecision:
-    """What production DALYN would do with the whole email.
-
-    All-or-nothing, for now: an email is uploaded only if every attachment
-    on it is WOULD_ENTER. If any one is not, the whole email goes to Manual
-    Review and nothing on it is entered, so a person never has to work out
-    which attachments DALYN already put in STAC. Switching to Partial is a
-    change to _decide_email alone.
-    """
-
-    UPLOAD = "UPLOAD"
-    MANUAL_REVIEW = "MANUAL_REVIEW"
-    GONE = "GONE"
-
-
 class EmailType:
     SINGLE = "SINGLE"
     MULTIPLE = "MULTIPLE"
     NONE = "NONE"
-
-
-class StacResult:
-    """What STAC did with one attachment.
-
-    ENTERED and REHEARSED both mean everything worked. The difference is only
-    whether stac.save_enabled was on.
-    """
-
-    ENTERED = "ENTERED"
-    REACHED_SAVE = "REACHED_SAVE"
-    REHEARSED = "REHEARSED"
-    FAILED = "FAILED"
-    UNKNOWN = "UNKNOWN"
-    NOT_ATTEMPTED = ""
 
 
 class TextSource:
@@ -709,6 +645,10 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
     work_dir = config["paths"]["temp"] / f"stac_{stamp}"
 
+    actions = config["mailbox_actions"]
+    tagged = 0
+    skipped_tagged = 0
+
     rows: list[dict] = []
     stac_failures = 0
     # Continuous across the whole pass, not reset per mailbox. Two emails both
@@ -742,7 +682,18 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
 
+                if actions["tag_enabled"]:
+                    # Before the first email, so a missing MailboxSettings
+                    # permission stops the pass before any work is done.
+                    client.ensure_categories(mailbox, ReviewTag.all(), ReviewTag.COLOR)
+
                 for position, message in enumerate(messages, start=1):
+                    if actions["skip_tagged"] and any(
+                        ReviewTag.is_dalyn(category) for category in message.get("categories") or []
+                    ):
+                        skipped_tagged += 1
+                        continue
+
                     email_number += 1
                     logger.info(
                         "%s message %s of %s (email %s), received %s",
@@ -769,6 +720,9 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
                     logger.info(summary)
                     rows.extend(email_rows)
+
+                    if actions["tag_enabled"] and tag_email(client, mailbox, message, email_rows):
+                        tagged += 1
 
                     if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
                         raise SystemProblem(
@@ -803,6 +757,11 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
         for address in config["enabled_mailboxes"]:
             logger.info("  %-40s %s", address, per_mailbox.get(address, 0))
 
+    if actions["tag_enabled"]:
+        logger.info("Tagged: %s email(s)", tagged)
+    if actions["skip_tagged"]:
+        logger.info("Skipped, already tagged by DALYN: %s email(s)", skipped_tagged)
+
     counts = Counter(row["outcome"] for row in rows)
     logger.info("Attachments: %s", len(rows))
     for outcome, count in counts.most_common():
@@ -832,8 +791,9 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 def _watch(config: dict, limit: int | None, interval: int) -> int:
     """Run a dry-run pass every `interval` seconds until Ctrl+C.
 
-    Nothing is moved, so the same newest email is read again every pass
-    until a newer one lands. The rules sheet is reloaded each pass, so a
+    Nothing is moved, so unless mailbox_actions.skip_tagged is on, the same
+    newest email is read again every pass until a newer one lands. With it
+    on, an email DALYN has tagged is left alone. The rules sheet is reloaded each pass, so a
     sheet edit shows up on the next pass without restarting.
 
     A failed credential stops the watch at once. Any other SystemProblem is

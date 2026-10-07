@@ -30,8 +30,25 @@ mailboxes:
 # Going to production requires a code change, on purpose.
 source_folder: "deleteditems"
 
-# Dry run: classify and log only. No STAC entry, no tagging, no moving.
+# Dry run: must stay true, this build refuses to start otherwise. What a dry
+# run does to STAC and to the mailbox is set by the stac and mailbox_actions
+# switches below.
 dry_run: true
+
+# What DALYN does to an email after handling it. All three are required.
+#
+#   tag_enabled   Adds a red "DALYN: ..." Outlook category naming what
+#                 happened, and keeps any categories staff already set.
+#                 Creates the categories in the mailbox the first time.
+#                 Needs Mail.ReadWrite and MailboxSettings.ReadWrite.
+#   move_enabled  Not built yet. Must be false or DALYN will not start.
+#   skip_tagged   true skips any email that already has a DALYN category,
+#                 which is how live running avoids filing an email twice.
+#                 false handles it again every pass, for repeat testing.
+mailbox_actions:
+  tag_enabled: false
+  move_enabled: false
+  skip_tagged: false
 
 # Dry run window. Only mail received in the last N days is eligible.
 days_back: 2

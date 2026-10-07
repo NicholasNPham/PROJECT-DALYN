@@ -169,6 +169,18 @@ class GraphClient:
             if response.status_code == 404 and gone_on_404:
                 raise MessageGone("Graph returned 404 for this message")
 
+            # Signed in fine but not allowed to do this. Almost always a
+            # permission the app registration lacks, and the raw Graph text
+            # does not say which one, so name the likely candidates.
+            if response.status_code == 403:
+                raise SystemProblem(
+                    f"Graph refused {method} with 403. The app registration is "
+                    "probably missing a permission: Mail.Read for reading, "
+                    "Mail.ReadWrite for tagging, MailboxSettings.ReadWrite for "
+                    "creating categories. Or Exchange's mailbox scope does not "
+                    f"cover this mailbox. {response.text[:200]}"
+                )
+
             if response.status_code in RETRY_ANY_METHOD or (
                 response.status_code in RETRY_GET_ONLY and method.upper() == "GET"
             ):
@@ -259,7 +271,7 @@ class GraphClient:
         params = {
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
-            "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview,body",
+            "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview,body,categories",
             "$top": min(max_messages, PAGE_SIZE) if max_messages else PAGE_SIZE,
         }
 
@@ -380,3 +392,62 @@ class GraphClient:
         )
 
         return files
+
+    def ensure_categories(self, mailbox: str, names: list[str], color: str) -> None:
+        """Make sure each category exists in the mailbox's master list.
+
+        A category applied to a message but missing from the master list
+        still works, but Outlook shows it uncolored. Creating it here is what
+        makes DALYN's tags red.
+
+        Names are compared ignoring case, the way Outlook does. A category
+        that already exists in another color is left alone: someone chose
+        that color in that mailbox, and DALYN has no business changing it.
+
+        Args:
+            mailbox: SMTP address of the mailbox.
+            names: Category names DALYN is about to use.
+            color: Graph color preset for new categories, e.g. "preset0".
+
+        Raises:
+            SystemProblem: On 403 (MailboxSettings.ReadWrite missing) or any
+                other Graph failure.
+        """
+        url = self._mailbox_url(mailbox, "outlook/masterCategories")
+        existing = {
+            category["displayName"].casefold(): category.get("color")
+            for category in self._request("GET", url).json().get("value", [])
+        }
+
+        for name in names:
+            current = existing.get(name.casefold())
+            if current is None:
+                self._request("POST", url, json={"displayName": name, "color": color})
+                logger.info("%s: created category %r", mailbox, name)
+            elif current != color:
+                logger.warning(
+                    "%s: category %r already exists in %s, not %s. Leaving it as is.",
+                    mailbox,
+                    name,
+                    current,
+                    color,
+                )
+
+    def set_categories(self, mailbox: str, message_id: str, categories: list[str]) -> None:
+        """Replace a message's categories with exactly this list.
+
+        Graph has no add-one-category call: a PATCH sets the whole list. The
+        caller is responsible for carrying over any categories staff set.
+
+        Args:
+            mailbox: SMTP address of the mailbox holding the message.
+            message_id: Graph message ID from list_messages.
+            categories: The complete list the message should end up with.
+
+        Raises:
+            MessageGone: If the message was deleted or purged meanwhile.
+            SystemProblem: On 403 (Mail.ReadWrite missing) or any other
+                Graph failure.
+        """
+        url = self._mailbox_url(mailbox, f"messages/{message_id}")
+        self._request("PATCH", url, gone_on_404=True, json={"categories": categories})
