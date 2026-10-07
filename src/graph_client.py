@@ -1,6 +1,7 @@
 """All Microsoft Graph calls for DALYN. The only file that talks to Microsoft."""
 
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 import msal
@@ -233,13 +234,19 @@ class GraphClient:
             days_back: int,
             max_messages: int | None = None,
             newest_first: bool = True,
+            keep: Callable[[dict], bool] | None = None,
     ) -> list[dict]:
         """Return messages from the source folder, following Graph's paging.
 
         Graph never returns a whole folder at once. It answers with one page
         and, when there is more, an @odata.nextLink to continue from. This
-        follows that link until it stops coming, or until max_messages is
-        reached.
+        follows that link until it stops coming, or until max_messages
+        messages have been kept.
+
+        With keep, a message that fails it is passed over and does not count
+        toward max_messages, so already-handled mail cannot use up a pass.
+        Paging still stops as soon as enough have been kept, rather than
+        reading the whole folder to filter it.
 
         Args:
             mailbox: SMTP address of the mailbox to read.
@@ -250,6 +257,7 @@ class GraphClient:
             newest_first: Sort order. True for dry runs, since recent mail is
                 what staff can still verify. False for production, so nothing
                 ages out while newer mail jumps the queue.
+            keep: Optional check on each message as listed. None keeps all.
 
         Returns:
             Message dicts with id, receivedDateTime, hasAttachments, subject,
@@ -272,7 +280,10 @@ class GraphClient:
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
             "$select": "id,receivedDateTime,hasAttachments,subject,bodyPreview,body,categories",
-            "$top": min(max_messages, PAGE_SIZE) if max_messages else PAGE_SIZE,
+            # A small page only pays off when every message counts. With keep,
+            # some will be passed over, and --limit 3 would otherwise page
+            # through a folder of handled mail three at a time.
+            "$top": min(max_messages, PAGE_SIZE) if max_messages and keep is None else PAGE_SIZE,
         }
 
         # Plain text rather than HTML, so a UCN split across tags or
@@ -280,6 +291,7 @@ class GraphClient:
         headers = {"Prefer": 'outlook.body-content-type="text"'}
 
         messages: list[dict] = []
+        passed_over = 0
         pages = 0
 
         while url:
@@ -293,7 +305,11 @@ class GraphClient:
 
             response = self._request("GET", url, params=params, headers=headers)
             payload = response.json()
-            messages.extend(payload.get("value", []))
+            for message in payload.get("value", []):
+                if keep is None or keep(message):
+                    messages.append(message)
+                else:
+                    passed_over += 1
 
             if max_messages and len(messages) >= max_messages:
                 messages = messages[:max_messages]
@@ -321,6 +337,8 @@ class GraphClient:
             "newest first" if newest_first else "oldest first",
             without,
         )
+        if keep is not None:
+            logger.info("%s: passed over %s message(s) already handled", mailbox, passed_over)
 
         return messages
 

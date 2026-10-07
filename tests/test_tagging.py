@@ -4,7 +4,7 @@ import pytest
 
 from exceptions import MessageGone, SystemProblem
 from models import EmailDecision, Outcome, ReviewTag, StacResult
-from tagging import categories_for, mark_processing, merge_categories, tag_email, was_interrupted
+from tagging import categories_for, mark_processing, merge_categories, needs_handling, tag_email, was_interrupted
 
 
 def _row(decision: str, outcome: str, stac_result: str = "") -> dict:
@@ -253,3 +253,25 @@ def test_finished_or_untouched_email_is_not_interrupted() -> None:
     assert not was_interrupted({"categories": ["Staff category"]})
     assert not was_interrupted({"categories": []})
     assert not was_interrupted({})
+
+
+# needs_handling
+
+
+def test_untagged_email_needs_handling() -> None:
+    """No DALYN category, staff ones included, means DALYN has not touched it."""
+    assert needs_handling({"categories": []})
+    assert needs_handling({})
+    assert needs_handling({"categories": ["Staff category"]})
+
+
+def test_email_with_a_result_tag_is_skipped() -> None:
+    """Any finished DALYN tag, including Interrupted, means leave it alone."""
+    assert not needs_handling({"categories": [ReviewTag.READY_TO_SAVE]})
+    assert not needs_handling({"categories": ["Staff category", ReviewTag.NO_UCN]})
+    assert not needs_handling({"categories": [ReviewTag.INTERRUPTED]})
+
+
+def test_interrupted_email_still_comes_through() -> None:
+    """Processing left behind must reach the interrupted check, not be skipped."""
+    assert needs_handling({"categories": [ReviewTag.PROCESSING]})

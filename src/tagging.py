@@ -93,6 +93,18 @@ def was_interrupted(message: dict) -> bool:
     return ReviewTag.PROCESSING in (message.get("categories") or [])
 
 
+def needs_handling(message: dict) -> bool:
+    """True when skip_tagged should still let this email through.
+
+    An email with no DALYN category has not been handled. One still carrying
+    Processing has to come through as well, or the interrupted check never
+    sees it and it sits in the folder unnoticed. Anything else DALYN tagged
+    has been dealt with.
+    """
+    categories = message.get("categories") or []
+    return was_interrupted(message) or not any(ReviewTag.is_dalyn(category) for category in categories)
+
+
 def mark_processing(client: GraphClient, mailbox: str, message: dict, email_number: int) -> None:
     """Tag the email Processing, before anything else is done with it.
 

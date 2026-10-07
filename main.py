@@ -38,7 +38,7 @@ from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProbl
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
-from tagging import mark_processing, tag_email, was_interrupted  # noqa: E402
+from tagging import mark_processing, needs_handling, tag_email, was_interrupted  # noqa: E402
 from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
@@ -671,7 +671,6 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     actions = config["mailbox_actions"]
     save_enabled = config["stac"].get("save_enabled", False)
     tagged = 0
-    skipped_tagged = 0
 
     rows: list[dict] = []
     stac_failures = 0
@@ -702,6 +701,10 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                     days_back=config["days_back"],
                     max_messages=remaining,
                     newest_first=config["newest_first"],
+                    # Skipped in the listing rather than here, so handled
+                    # mail does not use up the budget. needs_handling lets
+                    # interrupted emails through for the check below.
+                    keep=needs_handling if actions["skip_tagged"] else None,
                 )
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
@@ -712,16 +715,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                     client.ensure_categories(mailbox, ReviewTag.all(), ReviewTag.COLOR)
 
                 for position, message in enumerate(messages, start=1):
-                    # Checked before skip_tagged, because Processing is a
-                    # DALYN tag too: with skipping on, an interrupted email
-                    # would otherwise be skipped forever without anyone told.
                     interrupted = actions["tag_enabled"] and was_interrupted(message)
-
-                    if not interrupted and actions["skip_tagged"] and any(
-                        ReviewTag.is_dalyn(category) for category in message.get("categories") or []
-                    ):
-                        skipped_tagged += 1
-                        continue
 
                     email_number += 1
                     logger.info(
@@ -810,8 +804,6 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
     if actions["tag_enabled"]:
         logger.info("Tagged: %s email(s)", tagged)
-    if actions["skip_tagged"]:
-        logger.info("Skipped, already tagged by DALYN: %s email(s)", skipped_tagged)
 
     counts = Counter(row["outcome"] for row in rows)
     logger.info("Attachments: %s", len(rows))

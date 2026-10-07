@@ -144,10 +144,12 @@ class FakeSession:
         """Queue the responses, in the order the calls will be made."""
         self.responses = list(responses)
         self.calls: list[tuple[str, str, dict | None]] = []
+        self.params: list[dict | None] = []
 
     def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
         """Record the call and return the next scripted response."""
         self.calls.append((method, url, kwargs.get("json")))
+        self.params.append(kwargs.get("params"))
         return self.responses.pop(0)
 
 
@@ -229,3 +231,66 @@ def test_write_to_mailbox_off_the_allowlist_is_refused() -> None:
         client.ensure_categories("someone-else@example.com", [ReviewTag.FILED], ReviewTag.COLOR)
 
     assert session.calls == []
+
+
+# list_messages with keep
+
+
+def _message(message_id: str, tagged: bool = False) -> dict:
+    """A listed message, tagged by DALYN or not."""
+    return {"id": message_id, "hasAttachments": True, "categories": [ReviewTag.FILED] if tagged else []}
+
+
+def _page(messages: list[dict], more: bool) -> FakeResponse:
+    """One page of a Graph listing, with a nextLink when more pages follow."""
+    payload: dict = {"value": messages}
+    if more:
+        payload["@odata.nextLink"] = "https://graph.microsoft.com/v1.0/next-page"
+    return FakeResponse(200, payload)
+
+
+def _untagged(message: dict) -> bool:
+    """Stand-in for the real keep check: no DALYN category."""
+    return not any(ReviewTag.is_dalyn(category) for category in message["categories"])
+
+
+def test_passed_over_messages_do_not_count_toward_the_limit() -> None:
+    """Three tagged emails in front must not make a limit of 2 come back short."""
+    client, session = _client([
+        _page([_message("t1", True), _message("u1"), _message("t2", True)], more=True),
+        _page([_message("u2"), _message("u3")], more=True),
+    ])
+
+    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2, keep=_untagged)
+
+    assert [message["id"] for message in listed] == ["u1", "u2"]
+    assert len(session.calls) == 2
+
+
+def test_paging_stops_once_enough_are_kept() -> None:
+    """The next page is not fetched when the first already has enough."""
+    client, session = _client([_page([_message("u1"), _message("u2"), _message("u3")], more=True)])
+
+    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2, keep=_untagged)
+
+    assert [message["id"] for message in listed] == ["u1", "u2"]
+    assert len(session.calls) == 1
+
+
+def test_without_keep_every_message_counts() -> None:
+    """skip_tagged off: tagged mail is listed and counted exactly as before."""
+    client, _ = _client([_page([_message("t1", True), _message("u1"), _message("u2")], more=True)])
+
+    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2)
+
+    assert [message["id"] for message in listed] == ["t1", "u1"]
+
+
+def test_keep_asks_for_full_pages() -> None:
+    """--limit 3 with keep must not page through handled mail three at a time."""
+    client, session = _client([_page([], more=False), _page([], more=False)])
+
+    client.list_messages(MAILBOX, days_back=2, max_messages=3, keep=_untagged)
+    client.list_messages(MAILBOX, days_back=2, max_messages=3)
+
+    assert [params["$top"] for params in session.params] == [100, 3]
