@@ -41,7 +41,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 186 tests, no network or live systems |
+| Tests | `pytest`, 189 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,

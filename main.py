@@ -1,9 +1,11 @@
 """DALYN entry point.
 
-One dry-run pass over Deleted Items of the configured mailboxes. Reads, OCRs,
-classifies, takes each email as far into STAC as the stac switches allow, and
-logs. With mailbox_actions.tag_enabled it also puts a red "DALYN: ..." Outlook
-category on each email naming what happened. It moves nothing.
+One pass over the source folder of every enabled mailbox, up to a batch per
+mailbox. Reads, OCRs, classifies, takes each email as far into STAC as the
+stac switches allow, and logs. With mailbox_actions.tag_enabled it also puts
+"DALYN: ..." Outlook categories on each email: yellow while DALYN has it, red
+when filed, green when a person needs to look. With move_enabled, filed mail
+moves to the done folder and everything else stays where it is.
 
 Two outputs per run:
     logs/dalyn.log                   what happened, for Nick
@@ -646,6 +648,36 @@ def _write_csv(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
+def _log_mailbox_table(
+    mailboxes: list[str], emails: list[dict], listed: Counter, moved: Counter
+) -> None:
+    """Log one line per mailbox: listed, upload, review, moved, gone.
+
+    Counts emails, not attachments. Upload means the email went (or, before
+    Save is on, would go) into STAC whole; review means a person has it. A
+    mailbox that listed nothing still gets its row of zeros, which is the
+    point: an empty folder and a broken one look different here.
+
+    Args:
+        mailboxes: Enabled mailboxes, in config order.
+        emails: The first row of each email, carrying the email decision.
+        listed: Emails listed per mailbox this pass.
+        moved: Emails moved to the done folder per mailbox this pass.
+    """
+    decisions = Counter((row["mailbox"], row["email_decision"]) for row in emails)
+    logger.info("By mailbox (emails):             listed upload review  moved   gone")
+    for address in mailboxes:
+        logger.info(
+            "  %-30s %6s %6s %6s %6s %6s",
+            address,
+            listed.get(address, 0),
+            decisions.get((address, EmailDecision.UPLOAD), 0),
+            decisions.get((address, EmailDecision.MANUAL_REVIEW), 0),
+            moved.get(address, 0),
+            decisions.get((address, EmailDecision.GONE), 0),
+        )
+
+
 def run_dry_run(config: dict, limit: int | None = None) -> int:
     """One pass over the source folder of every enabled mailbox, in file order.
 
@@ -705,6 +737,10 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     actions = config["mailbox_actions"]
     tagged = 0
     moved = 0
+    # Per mailbox, for the end-of-pass table. The rows cannot give these:
+    # an empty folder leaves no rows, and moving is not recorded in them.
+    listed_by_mailbox: Counter = Counter()
+    moved_by_mailbox: Counter = Counter()
     # Emails that left the folder mid-run, by number. Listed at the end so a
     # person can check whoever took them filed them.
     gone: list[int] = []
@@ -736,6 +772,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 )
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
+                listed_by_mailbox[mailbox] = len(messages)
 
                 # Looked up before the first email, so a missing done folder
                 # stops the pass before any work is done.
@@ -818,6 +855,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                         client, mailbox, message, email_rows, done_folder_id, source_folder_id
                     ):
                         moved += 1
+                        moved_by_mailbox[mailbox] += 1
 
                     if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
                         raise SystemProblem(
@@ -843,13 +881,10 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
             if count:
                 logger.info("  %-8s %-13s %s", email_type, decision, count)
 
-    # Which mailbox a pass actually got through. With one enabled this repeats
-    # the totals below; with three it is the only place the split shows.
+    # With one mailbox this repeats the totals above. With several it is the
+    # only place an empty folder shows apart from one where everything failed.
     if len(config["enabled_mailboxes"]) > 1:
-        per_mailbox = Counter(row["mailbox"] for row in rows)
-        logger.info("Attachments by mailbox:")
-        for address in config["enabled_mailboxes"]:
-            logger.info("  %-40s %s", address, per_mailbox.get(address, 0))
+        _log_mailbox_table(config["enabled_mailboxes"], emails, listed_by_mailbox, moved_by_mailbox)
 
     if actions["tag_enabled"]:
         logger.info("Tagged: %s email(s)", tagged)
