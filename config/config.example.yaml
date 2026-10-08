@@ -119,15 +119,17 @@ stac:
   # Where an attachment goes when it has a good case number but matched no
   # rule: on the right case, under a code a person reviews inside STAC.
   #
-  # Live STAC has PLS/RVW for this, and these two may be left out entirely to
-  # get it. Test STAC has no PLS/RVW, so point it at something that exists
-  # there. TEST/TEST is the obvious choice: it is real in test STAC and
-  # unmistakable if it ever showed up anywhere else.
+  # Leave review_type and review_subtype out to use PLS RVW / PLS RVW, one
+  # string with a space, in both columns. Test STAC has that pair. Live STAC
+  # does not have it switched on yet (checked 8 Oct 2026); it has to be
+  # enabled in live STAC before go-live, or every no-rule document fails
+  # there. check_types.py flags it while it is missing from the live export.
   #
-  # Anything other than PLS/RVW is refused when is_test_instance is false. A
+  # Set both only to point a test instance at some other pair. Anything other
+  # than PLS RVW / PLS RVW is refused when is_test_instance is false, since a
   # stand-in code on live would file real filings where nobody looks.
-  review_type: "TEST"
-  review_subtype: "TEST"
+  # review_type: "PLS RVW"
+  # review_subtype: "PLS RVW"
 
 # Paths, relative to the project root
 paths:

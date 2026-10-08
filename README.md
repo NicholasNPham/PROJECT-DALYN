@@ -96,7 +96,3 @@ python -m pytest             # tests
 | `mailbox_actions.tag_enabled` | Label handled emails in Outlook |
 | `mailbox_actions.skip_tagged` | Skip emails already labeled |
 | `mailbox_actions.move_enabled` | Not built yet; must be false |
-
-**Status:** reading, classification, case numbers and upload are done and
-tested to the Save step. Next are skipping labeled mail, moving handled mail,
-scheduled unattended runs, and the switch to live systems.

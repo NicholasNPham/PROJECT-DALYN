@@ -120,6 +120,9 @@ def check_review_pair(
         "         Set stac.review_type and stac.review_subtype in config.yaml to a\n"
         "         pair this instance has. Every attachment that matches no rule\n"
         "         fails in STAC until then.\n"
+        "         This compares against the export in paths.stac_types. If that is\n"
+        "         live STAC's list while DALYN runs against test STAC, the pair may\n"
+        "         be fine in test and only need enabling in live before go-live.\n"
     )
     return True
 
