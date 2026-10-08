@@ -28,17 +28,27 @@ from logger import get_logger
 #   28 2026 CF 000000 CF AXMX
 # Felony is CF, misdemeanor MM, traffic CT. Traffic is written CT in some
 # places and TT in others for the same case, so in either court position CT
-# and TT are taken as the same thing. Anything else that differs between the
-# two court positions is not a case number.
+# and TT are taken as the same thing.
+#
+# Juvenile delinquency does not repeat its code: it is CJ first and JL
+# second, 28 2026 CJ 000000 JL AXMX. Seen on Highlands emails in Oct 2026,
+# which went to Manual Review with no case number until this pair was added.
+# Hardee is assumed to match, as it does for every other court.
+#
+# Any other pairing of the two court positions is not a case number. Only
+# the exact pairs here are accepted, so a new juvenile or civil code shows up
+# as "No case number" rather than being guessed at.
 #
 # The Polk shape skips 25 and 28. A Hardee number printed in the Polk shape
 # would otherwise come back with its division cut short, which is a wrong case
 # number rather than a missing one.
 UCN_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}[A-Z]{2}\d{6}[A-Z]\d{3}[A-Z]{2})")
 HIGHLANDS_HARDEE_PATTERN = re.compile(
-    r"(?<!\d)((?:25|28)\d{4}(CF|MM|CT|TT)\d{6}(CF|MM|CT|TT)AXMX)"
+    r"(?<!\d)((?:25|28)\d{4}(CF|MM|CT|TT|CJ)\d{6}(CF|MM|CT|TT|JL)AXMX)"
 )
 TRAFFIC_COURTS = frozenset({"CT", "TT"})
+# Courts whose second position is a different code from the first.
+SECOND_COURT = {"CJ": "JL"}
 
 # Highlands and Hardee documents rarely print the long form. These are the
 # shorter forms seen in them, all for the same case as 282026CF000000CFAXMX:
@@ -144,7 +154,13 @@ def _courts_agree(first: str, second: str) -> bool:
     """Return True if the two court positions of a long form name one court.
 
     CT and TT are interchangeable, per the Highlands and Hardee examples.
+    A court in SECOND_COURT must be followed by exactly its partner, and a
+    partner code never stands first.
     """
+    if first in SECOND_COURT:
+        return second == SECOND_COURT[first]
+    if second in SECOND_COURT.values():
+        return False
     return first == second or {first, second} <= TRAFFIC_COURTS
 
 
@@ -217,7 +233,12 @@ def to_long_form(ref: CaseRef) -> str | None:
     """
     if ref.county is None:
         return None
-    second = "TT" if ref.court == "CT" and ref.county == "28" else ref.court
+    if ref.court in SECOND_COURT:
+        second = SECOND_COURT[ref.court]
+    elif ref.court == "CT" and ref.county == "28":
+        second = "TT"
+    else:
+        second = ref.court
     return f"{ref.county}{ref.year}{ref.court}{ref.sequence}{second}AXMX"
 
 

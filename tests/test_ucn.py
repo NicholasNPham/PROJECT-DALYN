@@ -254,3 +254,37 @@ def test_highlands_row_keeps_county_less_short_forms():
 
 def test_row_with_no_chosen_case_keeps_everything():
     assert _labels("CF26-00000", None) == ["2026CF000000 (no county)"]
+
+
+# --- juvenile: CJ first, JL second ---------------------------------------
+
+
+def test_highlands_juvenile_long_form_matches():
+    assert ucn.find_all("282026CJ000000JLAXMX") == ["282026CJ000000JLAXMX"]
+
+
+def test_hardee_juvenile_dashed_long_form_matches():
+    assert ucn.find_all("25-2026-CJ-000000-JL-AXMX") == ["252026CJ000000JLAXMX"]
+
+
+def test_juvenile_from_the_subject_is_found():
+    subject = "282026CJ000000JLAXMX STATE OF FLORIDA VS DOE, JOHN - Notice"
+    assert ucn.find_ucn("", subject=subject) == "282026CJ000000JLAXMX"
+
+
+def test_juvenile_codes_only_pair_with_each_other():
+    # CJ repeated, JL first, or JL after another court: none is a case number.
+    assert ucn.find_all("282026CJ000000CJAXMX") == []
+    assert ucn.find_all("282026CF000000JLAXMX") == []
+    assert ucn.find_all("282026JL000000JLAXMX") == []
+
+
+def test_juvenile_long_form_rebuilds_with_jl():
+    ref = ucn.case_ref("282026CJ000000JLAXMX")
+    assert ref == ucn.CaseRef("28", "2026", "CJ", "000000")
+    assert ucn.to_long_form(ref) == "282026CJ000000JLAXMX"
+
+
+def test_juvenile_email_with_no_document_number_uses_email():
+    juvenile = "282026CJ000000JLAXMX"
+    assert _choose(subject=juvenile, document="Notice of Hearing") == ((juvenile, "subject"), "")
