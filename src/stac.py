@@ -21,6 +21,7 @@ log.
 
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from selenium import webdriver
@@ -39,7 +40,7 @@ from difflib import SequenceMatcher
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-from exceptions import DocumentProblem, SystemProblem
+from exceptions import DocumentProblem, MessageGone, SystemProblem
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -853,7 +854,14 @@ class StacSession:
 
     # ------------------------------------------------------------- add image
 
-    def add_documents(self, ucn: str, document_type: str, subtype: str, paths: list) -> None:
+    def add_documents(
+        self,
+        ucn: str,
+        document_type: str,
+        subtype: str,
+        paths: list,
+        before_save: Callable[[], bool] | None = None,
+    ) -> None:
         """Upload one group of files to the open case under one Type/Subtype.
 
         A STAC upload box carries a single Type and Subtype for everything in
@@ -866,9 +874,13 @@ class StacSession:
             document_type: STAC Type, e.g. COURT.
             subtype: STAC Subtype, e.g. ORDERS.
             paths: Absolute local paths. All get this Type and Subtype.
+            before_save: Called right before the Save click. False means the
+                email is no longer DALYN's (a person moved it), so the upload
+                is thrown away instead of saved. None skips the check.
 
         Raises:
             DocumentProblem: The Type/Subtype is not in STAC's matrix.
+            MessageGone: before_save said no. Nothing was saved in this box.
             SaveMayHaveHappened: Save was clicked and never confirmed.
             SystemProblem: Anything else in STAC misbehaved.
         """
@@ -892,6 +904,12 @@ class StacSession:
         if not self.save_enabled:
             self._reach_save_without_pressing(ucn, subtype, names)
             return
+
+        # Asked as late as possible: staff share the folder, and an email
+        # someone took while it uploaded may be getting filed by hand.
+        if before_save is not None and not before_save():
+            self._discard_pending_upload()
+            raise MessageGone("a person moved the email before Save")
 
         self._save(ucn, subtype, names)
 
@@ -1805,6 +1823,7 @@ class StacRunner:
         document_text: str = "",
         subject: str = "",
         body: str = "",
+        before_save: Callable[[], bool] | None = None,
     ) -> list:
         """File one email's documents on one case, retrying once if STAC wedges.
 
@@ -1815,14 +1834,18 @@ class StacRunner:
                 name check. "" skips the check for Polk.
             subject: Email subject, for the Highlands and Hardee name check.
             body: Email body, the same.
+            before_save: Asked before every Save click, so an email a person
+                moved partway through is not saved. See add_documents.
 
         Returns:
             The groups entered, as [((document_type, subtype), [path, ...])].
 
         Raises:
+            MessageGone: before_save said no before anything was saved.
             DocumentProblem: This email needs a person. Nothing was entered,
                 unless the error is PartiallyEntered, whose message lists what
-                was.
+                was. That includes before_save saying no after an earlier
+                box was already saved.
             SaveMayHaveHappened: Save was pressed with no confirmation. Never
                 retried, since that could file the same document twice.
             SystemProblem: STAC is broken and the retries are used up. The
@@ -1849,7 +1872,7 @@ class StacRunner:
                     self.session.find_case(ucn, document_text, subject, body)
 
                     document_type, subtype = key
-                    self.session.add_documents(ucn, document_type, subtype, paths)
+                    self.session.add_documents(ucn, document_type, subtype, paths, before_save)
                     entered.append((key, paths))
 
                     if self.fresh_browser:
@@ -1859,6 +1882,18 @@ class StacRunner:
                         self._restart_session()
 
                 return entered
+
+            except MessageGone as error:
+                # A person took the email mid-way. Never retried: it is
+                # theirs now. If an earlier box was already saved, they need
+                # to know which, or they will file it a second time.
+                self._leave_browser_clean()
+                if entered:
+                    raise PartiallyEntered(
+                        f"{self._already_in(entered)} Then someone moved the email "
+                        "and the rest was not saved."
+                    ) from error
+                raise
 
             except (DocumentProblem, SaveMayHaveHappened):
                 # Both are this document's problem, and neither improves by

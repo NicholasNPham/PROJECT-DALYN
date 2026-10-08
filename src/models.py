@@ -22,23 +22,33 @@ class ReviewTag:
     An uploaded email gets one of the three STAC outcomes, plus NO_RULE if any
     attachment went in under the review pair. A Manual Review email gets one
     tag per distinct reason it was held back.
+
+    Colors tell staff who has the email: yellow, DALYN is on it and nobody
+    touches it; red, filed and done; green, a person needs to look. Staff
+    work the Inbox alongside DALYN, so the color is the whole instruction.
     """
 
     PREFIX = "DALYN: "
 
-    # Graph's name for the first color in Outlook's category palette, red.
-    # Used only when DALYN creates a category in a mailbox's master list.
-    COLOR = "preset0"
+    # Graph's names for Outlook's category palette.
+    RED_COLOR = "preset0"
+    YELLOW_COLOR = "preset3"
+    GREEN_COLOR = "preset4"
 
-    # Put on the moment DALYN picks an email up, before anything is
-    # downloaded, and replaced by the result tag when it is done. Staff see
-    # straight away which email DALYN is on, and an email still carrying it
-    # on a later pass was being worked on when a run died.
+    # Yellow, in the order an email passes through them. The whole batch is
+    # tagged QUEUED before DALYN starts on any of it, so staff know which
+    # emails to leave alone. PROCESSING replaces it on the one email being
+    # worked, and SAVING replaces that just before Save is pressed.
+    #
+    # After a crash, only SAVING needs a person: up to then nothing is on the
+    # case, so a leftover QUEUED or PROCESSING email is simply done again.
+    QUEUED = "DALYN: Queued"
     PROCESSING = "DALYN: Processing"
+    SAVING = "DALYN: Saving"
 
-    # Found still carrying PROCESSING on a later pass while Save is on: a run
-    # died partway through it, maybe after Save. Held for a person, who
-    # checks STAC and clears the tag to let DALYN take it again.
+    # Found still carrying SAVING on a later pass: a run died around the
+    # Save click, so the document may or may not be on the case. Held for a
+    # person, who checks STAC and clears the tag to let DALYN take it again.
     INTERRUPTED = "DALYN: Interrupted"
 
     # Uploaded. Which one depends on how far the stac switches let it go, so
@@ -76,6 +86,20 @@ class ReviewTag:
             and isinstance(value, str)
             and value.startswith(cls.PREFIX)
         ]
+
+    @classmethod
+    def colors(cls) -> dict[str, str]:
+        """Return {tag: Graph color} for every tag.
+
+        Green unless listed otherwise, so a tag added later without a color
+        decision shows as one a person must look at, not as done.
+        """
+        yellow = {cls.QUEUED, cls.PROCESSING, cls.SAVING}
+        red = {cls.FILED, cls.NO_RULE}
+        return {
+            tag: cls.YELLOW_COLOR if tag in yellow else cls.RED_COLOR if tag in red else cls.GREEN_COLOR
+            for tag in cls.all()
+        }
 
     @classmethod
     def is_dalyn(cls, category: str) -> bool:

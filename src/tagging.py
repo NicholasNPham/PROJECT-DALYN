@@ -1,8 +1,12 @@
 """Decides which DALYN categories an email gets, and puts them on it in Outlook.
 
 Kept out of main.py so the decision can be tested without importing the
-script that reads live mail. main.py calls tag_email once per email, after
-STAC has finished with it.
+script that reads live mail.
+
+An email passes through the yellow tags in order: mark_queued tags the whole
+batch before any work starts, mark_processing the one being worked, and
+mark_saving just before Save. tag_email then replaces them with the red or
+green result, and move_email takes filed mail out of the folder.
 """
 
 from exceptions import MessageGone
@@ -38,6 +42,10 @@ STAC_FAILURE_TAGS = {
     StacResult.UNKNOWN: ReviewTag.MAY_BE_SAVED,
     StacResult.FAILED: ReviewTag.STAC_FAILED,
 }
+
+# Queued, Processing and Saving: DALYN still has the email. Read from the
+# colors so the two can never disagree about which tags are yellow.
+YELLOW_TAGS = frozenset(tag for tag, color in ReviewTag.colors().items() if color == ReviewTag.YELLOW_COLOR)
 
 
 def categories_for(rows: list[dict]) -> list[str]:
@@ -84,25 +92,70 @@ def merge_categories(existing: list[str], dalyn_tags: list[str]) -> list[str]:
 
 
 def was_interrupted(message: dict) -> bool:
-    """True when the email still carries Processing from an earlier run.
+    """True when the email still carries Saving from an earlier run.
 
     Read from the categories as listed, before this pass marks the email
-    itself. DALYN replaces Processing at the end of every email, so finding
-    it here means a run stopped partway through this one.
+    itself. Saving goes on just before the Save click and is replaced by the
+    result straight after, so finding it here means a run died around that
+    click, and the document may already be on the case. A leftover Queued or
+    Processing is not interrupted in this sense: Save was never pressed, so
+    the email is simply handled again.
     """
-    return ReviewTag.PROCESSING in (message.get("categories") or [])
+    return ReviewTag.SAVING in (message.get("categories") or [])
 
 
 def needs_handling(message: dict) -> bool:
     """True when skip_tagged should still let this email through.
 
     An email with no DALYN category has not been handled. One still carrying
-    Processing has to come through as well, or the interrupted check never
-    sees it and it sits in the folder unnoticed. Anything else DALYN tagged
-    has been dealt with.
+    a yellow tag was left mid-way by a run that stopped, and has to come
+    through too: to be redone, or for the interrupted check to see it.
+    Anything red or green has been dealt with.
     """
     categories = message.get("categories") or []
-    return was_interrupted(message) or not any(ReviewTag.is_dalyn(category) for category in categories)
+    dalyn = [category for category in categories if ReviewTag.is_dalyn(category)]
+    return not dalyn or any(category in YELLOW_TAGS for category in dalyn)
+
+
+def mark_queued(client: GraphClient, mailbox: str, messages: list[dict]) -> int:
+    """Tag the whole batch Queued, before DALYN starts on any of it.
+
+    Staff work the same folder, and this is what tells them which emails to
+    leave alone. Updates each message["categories"] to what was written.
+
+    An email carrying Saving is skipped: the interrupted check must still
+    see that tag when the loop reaches it. An email that vanished since the
+    listing is logged and left for process_message to find GONE.
+
+    Returns:
+        How many emails were tagged.
+
+    Raises:
+        SystemProblem: Any Graph failure other than the email being gone.
+            Not caught: a batch DALYN cannot mark is one staff were not
+            warned about.
+    """
+    queued = 0
+    for message in messages:
+        if was_interrupted(message):
+            continue
+
+        existing = message.get("categories") or []
+        merged = merge_categories(existing, [ReviewTag.QUEUED])
+        if merged == existing:
+            continue
+
+        try:
+            client.set_categories(mailbox, message["id"], merged)
+        except MessageGone as error:
+            logger.info("An email left the folder before it could be queued (%s)", error)
+            continue
+
+        message["categories"] = merged
+        queued += 1
+
+    logger.info("%s: queued %s email(s)", mailbox, queued)
+    return queued
 
 
 def mark_processing(client: GraphClient, mailbox: str, message: dict, email_number: int) -> None:
@@ -129,6 +182,38 @@ def mark_processing(client: GraphClient, mailbox: str, message: dict, email_numb
         return
 
     message["categories"] = merged
+
+
+def mark_saving(
+    client: GraphClient, mailbox: str, message: dict, source_folder_id: str, email_number: int
+) -> bool:
+    """Check the email is still DALYN's, then tag it Saving. Call just before Save.
+
+    Staff share the folder. If someone moved the email while DALYN was
+    uploading it, they may be filing it by hand, and pressing Save would put
+    it on the case twice. So the email's folder is read fresh from Graph
+    first, and Save goes ahead only if it has not moved.
+
+    Returns:
+        True when Save may be pressed. False when the email has moved or is
+        gone, in which case nothing is tagged and Save must not be pressed.
+
+    Raises:
+        SystemProblem: Any other Graph failure. Not caught: if DALYN cannot
+            mark Saving, a crash after Save could not be recognized later.
+    """
+    try:
+        if client.get_parent_folder_id(mailbox, message["id"]) != source_folder_id:
+            logger.warning("Email %s: moved by someone while DALYN worked on it. Not saving.", email_number)
+            return False
+        merged = merge_categories(message.get("categories") or [], [ReviewTag.SAVING])
+        client.set_categories(mailbox, message["id"], merged)
+    except MessageGone as error:
+        logger.warning("Email %s: gone while DALYN worked on it, not saving (%s)", email_number, error)
+        return False
+
+    message["categories"] = merged
+    return True
 
 
 def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]) -> bool:
@@ -163,4 +248,54 @@ def tag_email(client: GraphClient, mailbox: str, message: dict, rows: list[dict]
     # Only DALYN's own tags are logged. Staff categories are free text and
     # could name a party.
     logger.info("Email %s: tagged %s", rows[0]["email_number"], ", ".join(tags) or "(DALYN tags cleared)")
+    return True
+
+
+def should_move(rows: list[dict]) -> bool:
+    """True when this email is finished and should leave the folder.
+
+    Only an email STAC actually filed. One that reached Save or was
+    rehearsed stays put: nothing was filed. Mail for a person stays put
+    too, tagged green, because staff work it where it is. A GONE email is
+    already somewhere else.
+    """
+    return rows[0]["email_decision"] == EmailDecision.UPLOAD and rows[0]["stac_result"] == StacResult.ENTERED
+
+
+def move_email(
+    client: GraphClient,
+    mailbox: str,
+    message: dict,
+    rows: list[dict],
+    done_folder_id: str,
+    source_folder_id: str,
+) -> bool:
+    """Move a filed email to the done folder.
+
+    Called after tag_email, so the email carries its red tag with it. A move
+    into the folder the email is already in is skipped, for a config that
+    points done_folder at the source.
+
+    Args:
+        done_folder_id: From get_move_target_id.
+        source_folder_id: The folder the email was listed from.
+
+    Returns:
+        True when the email was moved.
+
+    Raises:
+        SystemProblem: Any Graph failure other than the email being gone.
+            Not caught: the email is already tagged red, so the next pass
+            will not file it again, and a person can move it by hand.
+    """
+    if not should_move(rows) or done_folder_id == source_folder_id:
+        return False
+
+    try:
+        client.move_message(mailbox, message["id"], done_folder_id)
+    except MessageGone as error:
+        logger.info("Email %s: not moved, it left the folder (%s)", rows[0]["email_number"], error)
+        return False
+
+    logger.info("Email %s: moved to the done folder", rows[0]["email_number"])
     return True

@@ -4,7 +4,18 @@ import pytest
 
 from exceptions import MessageGone, SystemProblem
 from models import EmailDecision, Outcome, ReviewTag, StacResult
-from tagging import categories_for, mark_processing, merge_categories, needs_handling, tag_email, was_interrupted
+from tagging import (
+    categories_for,
+    mark_processing,
+    mark_queued,
+    mark_saving,
+    merge_categories,
+    move_email,
+    needs_handling,
+    should_move,
+    tag_email,
+    was_interrupted,
+)
 
 
 def _row(decision: str, outcome: str, stac_result: str = "") -> dict:
@@ -242,13 +253,19 @@ def test_mark_processing_lets_graph_failure_stop_the_pass() -> None:
 # was_interrupted
 
 
-def test_leftover_processing_tag_means_interrupted() -> None:
-    """Processing is always replaced at the end, so finding it means a run died."""
-    assert was_interrupted({"categories": ["Staff category", ReviewTag.PROCESSING]})
+def test_leftover_saving_tag_means_interrupted() -> None:
+    """Saving is only on around the Save click; finding it means a run died there."""
+    assert was_interrupted({"categories": ["Staff category", ReviewTag.SAVING]})
+
+
+def test_leftover_queued_or_processing_is_not_interrupted() -> None:
+    """Save was never pressed, so the email is simply handled again."""
+    assert not was_interrupted({"categories": [ReviewTag.QUEUED]})
+    assert not was_interrupted({"categories": [ReviewTag.PROCESSING]})
 
 
 def test_finished_or_untouched_email_is_not_interrupted() -> None:
-    """A result tag, staff tags only, or no categories at all are all fine."""
+    """Only a leftover Saving counts."""
     assert not was_interrupted({"categories": [ReviewTag.FILED]})
     assert not was_interrupted({"categories": ["Staff category"]})
     assert not was_interrupted({"categories": []})
@@ -259,19 +276,213 @@ def test_finished_or_untouched_email_is_not_interrupted() -> None:
 
 
 def test_untagged_email_needs_handling() -> None:
-    """No DALYN category, staff ones included, means DALYN has not touched it."""
+    """No DALYN category: never handled."""
     assert needs_handling({"categories": []})
     assert needs_handling({})
     assert needs_handling({"categories": ["Staff category"]})
 
 
-def test_email_with_a_result_tag_is_skipped() -> None:
-    """Any finished DALYN tag, including Interrupted, means leave it alone."""
+def test_red_or_green_email_is_skipped() -> None:
+    """A result tag means DALYN is done with it."""
+    assert not needs_handling({"categories": [ReviewTag.FILED]})
     assert not needs_handling({"categories": [ReviewTag.READY_TO_SAVE]})
     assert not needs_handling({"categories": ["Staff category", ReviewTag.NO_UCN]})
     assert not needs_handling({"categories": [ReviewTag.INTERRUPTED]})
 
 
-def test_interrupted_email_still_comes_through() -> None:
-    """Processing left behind must reach the interrupted check, not be skipped."""
-    assert needs_handling({"categories": [ReviewTag.PROCESSING]})
+@pytest.mark.parametrize("tag", [ReviewTag.QUEUED, ReviewTag.PROCESSING, ReviewTag.SAVING])
+def test_yellow_email_left_by_a_crash_comes_through(tag: str) -> None:
+    """A run that stopped mid-batch must not strand its yellow emails."""
+    assert needs_handling({"categories": ["Staff category", tag]})
+
+
+# Fake Graph for queueing, saving and moving
+
+
+class FakeGraph:
+    """Stands in for the GraphClient calls tagging makes, recording each one."""
+
+    def __init__(
+        self,
+        folder: str = "source-id",
+        gone: frozenset[str] = frozenset(),
+        error: Exception | None = None,
+    ) -> None:
+        """folder: where every email is now. gone: IDs that 404. error: raised by every call."""
+        self.folder = folder
+        self.gone = gone
+        self.error = error
+        self.calls: list[tuple] = []
+
+    def _check(self, message_id: str) -> None:
+        """Raise the scripted error, or MessageGone for a gone ID."""
+        if self.error:
+            raise self.error
+        if message_id in self.gone:
+            raise MessageGone("not found")
+
+    def set_categories(self, mailbox: str, message_id: str, categories: list[str]) -> None:
+        """Record a tag write."""
+        self._check(message_id)
+        self.calls.append(("tag", message_id, categories))
+
+    def get_parent_folder_id(self, mailbox: str, message_id: str) -> str:
+        """Return the scripted folder."""
+        self._check(message_id)
+        self.calls.append(("folder", message_id))
+        return self.folder
+
+    def move_message(self, mailbox: str, message_id: str, destination_id: str) -> None:
+        """Record a move."""
+        self._check(message_id)
+        self.calls.append(("move", message_id, destination_id))
+
+
+# mark_queued
+
+
+def test_whole_batch_is_queued_keeping_staff_categories() -> None:
+    """Every email goes yellow before any work, and staff tags stay."""
+    client = FakeGraph()
+    messages = [{"id": "m1", "categories": ["Staff category"]}, {"id": "m2"}]
+
+    assert mark_queued(client, "box", messages) == 2
+    assert client.calls == [
+        ("tag", "m1", ["Staff category", ReviewTag.QUEUED]),
+        ("tag", "m2", [ReviewTag.QUEUED]),
+    ]
+    assert messages[1]["categories"] == [ReviewTag.QUEUED]
+
+
+def test_queueing_leaves_saving_for_the_interrupted_check() -> None:
+    """Overwriting Saving would hide that a run died around Save."""
+    client = FakeGraph()
+    message = {"id": "m1", "categories": [ReviewTag.SAVING]}
+
+    assert mark_queued(client, "box", [message]) == 0
+    assert client.calls == []
+    assert was_interrupted(message)
+
+
+def test_queueing_replaces_a_leftover_processing() -> None:
+    """Processing from a stopped run is safe to redo, so it is queued again."""
+    client = FakeGraph()
+
+    mark_queued(client, "box", [{"id": "m1", "categories": [ReviewTag.PROCESSING]}])
+
+    assert client.calls == [("tag", "m1", [ReviewTag.QUEUED])]
+
+
+def test_queueing_skips_a_vanished_email() -> None:
+    """Gone between listing and queueing: the rest of the batch still gets tagged."""
+    client = FakeGraph(gone=frozenset({"m1"}))
+
+    assert mark_queued(client, "box", [{"id": "m1"}, {"id": "m2"}]) == 1
+    assert client.calls == [("tag", "m2", [ReviewTag.QUEUED])]
+
+
+def test_queueing_lets_graph_failure_stop_the_pass() -> None:
+    """Staff must not be left unwarned while DALYN works on."""
+    with pytest.raises(SystemProblem):
+        mark_queued(FakeGraph(error=SystemProblem("Graph 500")), "box", [{"id": "m1"}])
+
+
+# mark_saving
+
+
+def test_saving_is_marked_when_the_email_is_still_there() -> None:
+    """Checked fresh, then Processing becomes Saving."""
+    client = FakeGraph()
+    message = {"id": "m1", "categories": ["Staff category", ReviewTag.PROCESSING]}
+
+    assert mark_saving(client, "box", message, "source-id", 1)
+    assert client.calls == [("folder", "m1"), ("tag", "m1", ["Staff category", ReviewTag.SAVING])]
+    assert was_interrupted(message)
+
+
+def test_email_moved_by_a_person_is_not_saved() -> None:
+    """Someone took it mid-upload and may be filing it by hand."""
+    client = FakeGraph(folder="somewhere-else")
+    message = {"id": "m1", "categories": [ReviewTag.PROCESSING]}
+
+    assert not mark_saving(client, "box", message, "source-id", 1)
+    assert client.calls == [("folder", "m1")]
+    assert message["categories"] == [ReviewTag.PROCESSING]
+
+
+def test_deleted_email_is_not_saved() -> None:
+    """Gone entirely: same answer, do not press Save."""
+    assert not mark_saving(FakeGraph(gone=frozenset({"m1"})), "box", {"id": "m1"}, "source-id", 1)
+
+
+def test_saving_lets_graph_failure_stop_the_pass() -> None:
+    """Unable to mark Saving means a crash after Save could not be recognized."""
+    with pytest.raises(SystemProblem):
+        mark_saving(FakeGraph(error=SystemProblem("Graph 500")), "box", {"id": "m1"}, "source-id", 1)
+
+
+# should_move and move_email
+
+
+def test_filed_email_should_move() -> None:
+    """Only a document STAC actually saved counts as finished."""
+    assert should_move([_row(EmailDecision.UPLOAD, Outcome.WOULD_ENTER, StacResult.ENTERED)])
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [_row(EmailDecision.UPLOAD, Outcome.WOULD_ENTER, StacResult.REACHED_SAVE)],
+        [_row(EmailDecision.UPLOAD, Outcome.WOULD_ENTER, StacResult.REHEARSED)],
+        [_row(EmailDecision.MANUAL_REVIEW, Outcome.NO_UCN)],
+        [_row(EmailDecision.MANUAL_REVIEW, Outcome.WOULD_ENTER, StacResult.UNKNOWN)],
+        [_row(EmailDecision.MANUAL_REVIEW, Outcome.INTERRUPTED)],
+        [_row(EmailDecision.GONE, Outcome.GONE)],
+    ],
+)
+def test_everything_else_stays_put(rows: list[dict]) -> None:
+    """Green mail stays for staff; unsaved and gone mail is not finished here."""
+    assert not should_move(rows)
+
+
+FILED = [_row(EmailDecision.UPLOAD, Outcome.WOULD_ENTER, StacResult.ENTERED)]
+
+
+def test_filed_email_is_moved_to_the_done_folder() -> None:
+    """The done folder's ID is what reaches Graph."""
+    client = FakeGraph()
+
+    assert move_email(client, "box", {"id": "m1"}, FILED, "done-id", "source-id")
+    assert client.calls == [("move", "m1", "done-id")]
+
+
+def test_review_email_is_not_moved() -> None:
+    """Green mail stays where staff work."""
+    client = FakeGraph()
+    rows = [_row(EmailDecision.MANUAL_REVIEW, Outcome.NO_UCN)]
+
+    assert not move_email(client, "box", {"id": "m1"}, rows, "done-id", "source-id")
+    assert client.calls == []
+
+
+def test_move_into_the_source_folder_is_skipped() -> None:
+    """done_folder pointed at the source: nothing to do."""
+    client = FakeGraph()
+
+    assert not move_email(client, "box", {"id": "m1"}, FILED, "source-id", "source-id")
+    assert client.calls == []
+
+
+def test_move_of_vanished_email_is_skipped() -> None:
+    """Someone else moved or deleted it first, which is not a failure."""
+    client = FakeGraph(gone=frozenset({"m1"}))
+
+    assert not move_email(client, "box", {"id": "m1"}, FILED, "done-id", "source-id")
+
+
+def test_move_lets_graph_failure_stop_the_pass() -> None:
+    """Any other failure is DALYN's problem, not this email's."""
+    client = FakeGraph(error=SystemProblem("Graph 500"))
+
+    with pytest.raises(SystemProblem):
+        move_email(client, "box", {"id": "m1"}, FILED, "done-id", "source-id")

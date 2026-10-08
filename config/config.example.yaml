@@ -35,20 +35,31 @@ source_folder: "deleteditems"
 # switches below.
 dry_run: true
 
-# What DALYN does to an email after handling it. All three are required.
+# What DALYN does to an email it handles. All four are required.
 #
-#   tag_enabled   Adds a red "DALYN: ..." Outlook category naming what
-#                 happened, and keeps any categories staff already set.
-#                 Creates the categories in the mailbox the first time.
-#                 Needs Mail.ReadWrite and MailboxSettings.ReadWrite.
-#   move_enabled  Not built yet. Must be false or DALYN will not start.
-#   skip_tagged   true skips any email that already has a DALYN category,
-#                 which is how live running avoids filing an email twice.
-#                 false handles it again every pass, for repeat testing.
+#   tag_enabled   Adds "DALYN: ..." Outlook categories, keeping any staff
+#                 already set. Yellow while DALYN has the email (Queued,
+#                 Processing, Saving), red when filed, green when a person
+#                 needs to look. Creates the categories the first time and
+#                 corrects their colors. Needs Mail.ReadWrite and
+#                 MailboxSettings.ReadWrite.
+#   move_enabled  After tagging, moves filed mail to done_folder. Mail a
+#                 person must handle stays where it is, tagged green. Needs
+#                 tag_enabled. Required when reading the Inbox with Save on.
+#   skip_tagged   true skips any email with a red or green DALYN tag, which
+#                 is how live running avoids filing an email twice. Clearing
+#                 a green tag hands the email back to DALYN. false handles
+#                 everything again every pass, for repeat testing.
+#   done_folder   Required even while moving is off. Live: "deleteditems".
+#                 Testing: "deleteditems/DALYN Completed", a folder made by
+#                 hand inside Deleted Items, standing in for Deleted Items
+#                 while Deleted Items stands in for the Inbox. DALYN never
+#                 creates folders. graph_client.MOVE_TARGETS holds the list.
 mailbox_actions:
   tag_enabled: false
   move_enabled: false
   skip_tagged: false
+  done_folder: "deleteditems/DALYN Completed"
 
 # Dry run window. Only mail received in the last N days is eligible.
 days_back: 2

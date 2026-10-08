@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,15 @@ from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProbl
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
-from tagging import mark_processing, needs_handling, tag_email, was_interrupted  # noqa: E402
+from tagging import (  # noqa: E402
+    mark_processing,
+    mark_queued,
+    mark_saving,
+    move_email,
+    needs_handling,
+    tag_email,
+    was_interrupted,
+)
 from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
@@ -356,7 +365,7 @@ def _interrupted_rows(mailbox: str, message: dict) -> list[dict]:
         "received_utc": message.get("receivedDateTime", ""),
     }
     row = _email_row(base_row, ucn.find_ucn("", subject=subject), ucn.find_all(body_text))
-    return [_finish(row, Outcome.INTERRUPTED, "Still tagged Processing from an earlier run")]
+    return [_finish(row, Outcome.INTERRUPTED, "Still tagged Saving from an earlier run")]
 
 
 def _email_text(message: dict) -> tuple[str, str]:
@@ -472,7 +481,7 @@ def _decide_email(rows: list[dict], email_number: int, keep_decision: bool = Fal
         email_type, decision, reason = (
             EmailType.NONE,
             EmailDecision.MANUAL_REVIEW,
-            "Interrupted on an earlier run with Save on; check STAC, then clear the tag",
+            "Interrupted around Save on an earlier run; check STAC, then clear the tag",
         )
     else:
         email_type = EmailType.SINGLE if len(rows) == 1 else EmailType.MULTIPLE
@@ -536,7 +545,12 @@ def _stac_documents(rows: list[dict], work_dir: Path, email_number: int) -> list
 
 
 def _enter_in_stac(
-    runner, rows: list[dict], work_dir: Path, email_number: int, message: dict
+    runner,
+    rows: list[dict],
+    work_dir: Path,
+    email_number: int,
+    message: dict,
+    before_save: Callable[[], bool] | None = None,
 ) -> bool:
     """Put one email's documents into STAC and record the result on each row.
 
@@ -545,6 +559,11 @@ def _enter_in_stac(
 
     The message is passed for its subject and body, which the Highlands and
     Hardee name check searches for STAC's defendant.
+
+    before_save is asked right before each Save click. When it says no, a
+    person moved the email mid-way, and it is recorded GONE: it is theirs
+    now, and nothing of it was saved. If part of it was already saved, STAC
+    raises PartiallyEntered instead and the email goes to a person.
 
     A STAC failure is recorded against this email and the pass carries on.
     One email with a page that will not settle should not end a run, and
@@ -567,7 +586,14 @@ def _enter_in_stac(
     subject, body = _email_text(message)
 
     try:
-        runner.enter_email(ucn_value, documents, document_text, subject, body)
+        runner.enter_email(ucn_value, documents, document_text, subject, body, before_save=before_save)
+    except MessageGone as error:
+        for row in rows:
+            row["email_decision"] = EmailDecision.GONE
+            row["email_reason"] = f"Moved by a person while DALYN worked on it, not saved: {error}"
+        logger.warning("Email %s: %s. Not saved.", email_number, error)
+        # Not STAC's failure, so it does not count towards giving up.
+        return True
     except SaveMayHaveHappened as error:
         _mark_stac(enterable, StacResult.UNKNOWN, str(error))
         logger.error("Email %s: %s", email_number, error)
@@ -678,8 +704,11 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
     work_dir = config["paths"]["temp"] / f"stac_{stamp}"
 
     actions = config["mailbox_actions"]
-    save_enabled = config["stac"].get("save_enabled", False)
     tagged = 0
+    moved = 0
+    # Emails that left the folder mid-run, by number. Listed at the end so a
+    # person can check whoever took them filed them.
+    gone: list[int] = []
 
     rows: list[dict] = []
     stac_failures = 0
@@ -718,10 +747,21 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
 
+                # Looked up before the first email, so a missing done folder
+                # stops the pass before any work is done.
+                done_folder_id = (
+                    client.get_move_target_id(mailbox, actions["done_folder"])
+                    if actions["move_enabled"]
+                    else None
+                )
+
                 if actions["tag_enabled"]:
                     # Before the first email, so a missing MailboxSettings
                     # permission stops the pass before any work is done.
-                    client.ensure_categories(mailbox, ReviewTag.all(), ReviewTag.COLOR)
+                    client.ensure_categories(mailbox, ReviewTag.colors())
+                    # The whole batch goes yellow before DALYN starts on any
+                    # of it, so staff sharing the folder know to leave it.
+                    mark_queued(client, mailbox, messages)
 
                 for position, message in enumerate(messages, start=1):
                     interrupted = actions["tag_enabled"] and was_interrupted(message)
@@ -736,10 +776,11 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                         message.get("receivedDateTime"),
                     )
 
-                    if interrupted and save_enabled:
-                        # The run that died may have pressed Save. Doing it
-                        # again could file the document twice, so a person
-                        # checks STAC first. Nothing is downloaded.
+                    if interrupted:
+                        # The run that died was around the Save click and
+                        # may have pressed it. Doing it again could file the
+                        # document twice, so a person checks STAC first.
+                        # Nothing is downloaded, and it stays where it is.
                         email_rows = _interrupted_rows(mailbox, message)
                         logger.warning(_decide_email(email_rows, email_number))
                         rows.extend(email_rows)
@@ -747,15 +788,15 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                             tagged += 1
                         continue
 
-                    if interrupted:
-                        logger.warning(
-                            "Email %s was interrupted on an earlier run. Save is off, "
-                            "so nothing can have been filed; handling it again.",
-                            email_number,
-                        )
-
+                    before_save = None
                     if actions["tag_enabled"]:
                         mark_processing(client, mailbox, message, email_number)
+                        # Bound now, called by STAC just before each Save.
+                        # Checks a person has not taken the email, then
+                        # marks it Saving.
+                        before_save = lambda message=message, number=email_number: mark_saving(  # noqa: E731
+                            client, mailbox, message, source_folder_id, number
+                        )
 
                     email_rows = _process_message(
                         client, mailbox, message, rules, source_folder_id
@@ -763,7 +804,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                     summary = _decide_email(email_rows, email_number)
 
                     if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
-                        if _enter_in_stac(runner, email_rows, work_dir, email_number, message):
+                        if _enter_in_stac(runner, email_rows, work_dir, email_number, message, before_save):
                             stac_failures = 0
                         else:
                             stac_failures += 1
@@ -777,6 +818,16 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
                     if actions["tag_enabled"] and tag_email(client, mailbox, message, email_rows):
                         tagged += 1
+
+                    if email_rows[0]["email_decision"] == EmailDecision.GONE:
+                        gone.append(email_number)
+
+                    # Whether or not tag_email changed anything: an email
+                    # tagged on an earlier pass still needs moving.
+                    if done_folder_id and move_email(
+                        client, mailbox, message, email_rows, done_folder_id, source_folder_id
+                    ):
+                        moved += 1
 
                     if stac_failures >= MAX_CONSECUTIVE_STAC_FAILURES:
                         raise SystemProblem(
@@ -813,6 +864,17 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
     if actions["tag_enabled"]:
         logger.info("Tagged: %s email(s)", tagged)
+    if actions["move_enabled"]:
+        logger.info("Moved: %s to the done folder", moved)
+
+    if gone:
+        # Numbers only, matching the CSV. Whoever took these has them now;
+        # this is the prompt to check they were filed, not left.
+        logger.warning(
+            "%s email(s) left the folder mid-run: email %s. Check whoever took them filed them.",
+            len(gone),
+            ", ".join(str(number) for number in gone),
+        )
 
     counts = Counter(row["outcome"] for row in rows)
     logger.info("Attachments: %s", len(rows))
@@ -843,10 +905,12 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 def _watch(config: dict, limit: int | None, interval: int) -> int:
     """Run a dry-run pass every `interval` seconds until Ctrl+C.
 
-    Nothing is moved, so unless mailbox_actions.skip_tagged is on, the same
-    newest email is read again every pass until a newer one lands. With it
-    on, an email DALYN has tagged is left alone. The rules sheet is reloaded each pass, so a
-    sheet edit shows up on the next pass without restarting.
+    Unless mailbox_actions.skip_tagged is on, an email still in the source
+    folder is read again every pass. With it on, an email DALYN has tagged is
+    left alone. move_enabled takes filed mail out of the folder; mail for a
+    person stays, tagged green. The rules
+    sheet is reloaded each pass, so a sheet edit shows up on the next pass
+    without restarting.
 
     A failed credential stops the watch at once. Any other SystemProblem is
     logged and retried next pass, up to MAX_CONSECUTIVE_FAILURES in a row.

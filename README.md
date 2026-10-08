@@ -20,8 +20,11 @@ sure about.
 6. Anything uncertain, such as a missing or conflicting case number, an
    unreadable scan, or a defendant name that does not match, goes to a person
    instead. DALYN never guesses.
-7. Each email is labeled in Outlook with what happened, so staff can see the
-   result at a glance.
+7. Each email is labeled in Outlook by color, since staff work the same
+   Inbox. Yellow means DALYN has it and nobody should touch it. Red means
+   filed, and the email moves to Deleted Items. Green names what went wrong
+   and the email stays in the Inbox for a person, who can fix the cause and
+   clear the label to have DALYN try again.
 
 It runs in stages, each switched on deliberately: read only, upload without
 saving, then save.
@@ -38,7 +41,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 101 tests, no network or live systems |
+| Tests | `pytest`, 178 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,
@@ -95,4 +98,4 @@ python -m pytest             # tests
 | `stac.save_enabled` | Press Save |
 | `mailbox_actions.tag_enabled` | Label handled emails in Outlook |
 | `mailbox_actions.skip_tagged` | Skip emails already labeled |
-| `mailbox_actions.move_enabled` | Not built yet; must be false |
+| `mailbox_actions.move_enabled` | Move filed emails to `done_folder`; needs `tag_enabled`, and is required when reading the Inbox with Save on |

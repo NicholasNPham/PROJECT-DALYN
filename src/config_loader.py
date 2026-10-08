@@ -13,6 +13,7 @@ import yaml
 
 from credential import load_credentials
 from exceptions import SystemProblem
+from graph_client import MOVE_TARGETS
 from logger import get_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +47,8 @@ MAILBOX_KEYS = ("address", "enabled")
 # What DALYN may do to a message once it has handled it. All three are
 # required, with no defaults, because each one writes to a real mailbox.
 MAILBOX_ACTION_KEYS = ("tag_enabled", "move_enabled", "skip_tagged")
+# Where moved mail goes: filed mail, and mail a person must handle.
+MOVE_FOLDER_KEYS = ("done_folder",)
 
 # A url is treated as a test instance only if one of these appears in it.
 # Deliberately crude: the point is that a plain production url cannot be
@@ -214,6 +217,20 @@ def _validate(config: dict, path: Path) -> None:
     _validate_review_pair(stac)
     _validate_mailbox_actions(config["mailbox_actions"])
 
+    # Staff and DALYN share the Inbox. A filed email left there carries only
+    # its red tag, and a person who clears that tag hands it back to DALYN,
+    # which files it again. Moving it out is what makes that impossible.
+    if (
+        str(config["source_folder"]).strip().lower() == "inbox"
+        and stac.get("save_enabled")
+        and not config["mailbox_actions"]["move_enabled"]
+    ):
+        raise SystemProblem(
+            "Config reads the Inbox with stac.save_enabled true but "
+            "mailbox_actions.move_enabled false. Filed mail would stay in the "
+            "Inbox where it could be filed twice. Turn moving on, or Save off."
+        )
+
     paths = config["paths"]
     if not isinstance(paths, dict):
         raise SystemProblem("Config key 'paths' must be a mapping.")
@@ -226,18 +243,19 @@ def _validate(config: dict, path: Path) -> None:
 def _validate_mailbox_actions(actions: dict) -> None:
     """Check the tag, move and skip switches before anything touches a mailbox.
 
-    move_enabled is refused while true because moving is not built yet. A
-    switch that is accepted but does nothing would let someone believe mail
-    is being moved out of the Inbox when it is not.
+    done_folder is required even while move_enabled is false, so turning
+    moving on is one switch and not a hunt for a missing setting. There is no
+    review folder: mail a person must handle stays where it is, tagged green.
 
     Raises:
         SystemProblem: If the section is not a mapping, a switch is missing or
-            not a boolean, or move_enabled is true.
+            not a boolean, done_folder is not one DALYN may move into, or
+            move_enabled is on without tag_enabled.
     """
     if not isinstance(actions, dict):
         raise SystemProblem("Config key 'mailbox_actions' must be a mapping.")
 
-    missing = [key for key in MAILBOX_ACTION_KEYS if key not in actions]
+    missing = [key for key in MAILBOX_ACTION_KEYS + MOVE_FOLDER_KEYS if key not in actions]
     if missing:
         raise SystemProblem(f"Config 'mailbox_actions' is missing: {', '.join(missing)}")
 
@@ -245,10 +263,20 @@ def _validate_mailbox_actions(actions: dict) -> None:
         if not isinstance(actions[key], bool):
             raise SystemProblem(f"Config key 'mailbox_actions.{key}' must be true or false.")
 
-    if actions["move_enabled"]:
+    for key in MOVE_FOLDER_KEYS:
+        value = actions[key]
+        if not isinstance(value, str) or value.strip().lower() not in MOVE_TARGETS:
+            raise SystemProblem(
+                f"Config key 'mailbox_actions.{key}' is {value!r}. DALYN may only "
+                f"move mail into: {', '.join(sorted(MOVE_TARGETS))}."
+            )
+
+    # A moved email leaves the folder DALYN reads, and its tag is the only
+    # record left of what happened to it. Moving untagged mail would lose that.
+    if actions["move_enabled"] and not actions["tag_enabled"]:
         raise SystemProblem(
-            "Config has mailbox_actions.move_enabled true, but this build cannot "
-            "move mail yet. Set it to false."
+            "Config has mailbox_actions.move_enabled true but tag_enabled false. "
+            "Moved mail must carry its result tag. Turn tagging on, or moving off."
         )
 
 

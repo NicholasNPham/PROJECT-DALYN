@@ -15,6 +15,24 @@ GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 
 ALLOWED_FOLDERS = frozenset({"deleteditems"})
 
+# Folders DALYN may move mail INTO, compared ignoring case. Kept apart from
+# ALLOWED_FOLDERS on purpose: that list is where DALYN reads from, and adding
+# a destination there would let it read the destination too. Only filed mail
+# is moved. Mail a person must handle stays where it is, tagged green, so
+# staff keep working where they always have.
+#
+# "deleteditems" is the live destination. The child folder stands in for it
+# while testing: DALYN reads Deleted Items as if it were the Inbox, and moves
+# filed mail into the child as if it were Deleted Items. A listing of
+# Deleted Items does not include its child folders, so moved mail drops out
+# of what DALYN reads, exactly as it will when it leaves the Inbox.
+MOVE_TARGETS = frozenset({"deleteditems", "deleteditems/dalyn completed"})
+
+# Asks Graph for message IDs that survive a move. Staff work the same Inbox
+# as DALYN, and a default ID changes when someone drags the email to another
+# folder, which would leave DALYN unable to clear its yellow tag off it.
+IMMUTABLE_ID = 'IdType="ImmutableId"'
+
 # How many messages to ask Graph for per page. Graph caps this at 1000 for
 # messages and may return fewer whatever is asked for, which is exactly why
 # @odata.nextLink has to be followed rather than trusting one big $top.
@@ -95,7 +113,9 @@ class GraphClient:
         logger.error("Token request failed: %s", error_code)
         raise GraphAuthError(f"Token request failed: {error_code}: {description}")
 
-    def _mailbox_url(self, mailbox: str, path: str) -> str:
+    def _mailbox_url(
+        self, mailbox: str, path: str, folders: frozenset[str] = ALLOWED_FOLDERS
+    ) -> str:
         """Build a Graph URL for a mailbox, refusing anything outside the allowlist.
 
         This is the only place in DALYN that builds a /users/ URL. The app
@@ -108,6 +128,9 @@ class GraphClient:
         Args:
             mailbox: SMTP address of the target mailbox.
             path: Graph path below the user, e.g. "mailFolders/deleteditems/messages".
+            folders: Which folders a mailFolders/ path may name. ALLOWED_FOLDERS,
+                where DALYN reads, unless the caller is looking up a move
+                destination, which passes MOVE_TARGETS instead.
 
         Returns:
             Fully qualified Graph URL.
@@ -121,7 +144,7 @@ class GraphClient:
 
         if path.startswith("mailFolders/"):
             folder = path.split("/")[1].lower()
-            if folder not in ALLOWED_FOLDERS:
+            if folder not in folders:
                 raise SystemProblem(
                     f"Refusing request: folder not on allowlist: {folder}"
                 )
@@ -151,7 +174,10 @@ class GraphClient:
             SystemProblem: On any other non-success status, or if retries run out.
             requests.RequestException: On network failure, meaning try next pass.
         """
-        extra_headers = kwargs.pop("headers", {})
+        extra_headers = dict(kwargs.pop("headers", {}))
+        # Every call, so an ID read in one call is valid in the next. Graph
+        # takes several preferences in one Prefer header, comma-separated.
+        extra_headers["Prefer"] = ", ".join(filter(None, [extra_headers.get("Prefer"), IMMUTABLE_ID]))
 
         for attempt in range(MAX_RETRIES):
             headers = {"Authorization": f"Bearer {self._get_token()}"}
@@ -411,21 +437,21 @@ class GraphClient:
 
         return files
 
-    def ensure_categories(self, mailbox: str, names: list[str], color: str) -> None:
-        """Make sure each category exists in the mailbox's master list.
+    def ensure_categories(self, mailbox: str, colors: dict[str, str]) -> None:
+        """Make sure each category exists in the mailbox's master list, in its color.
 
         A category applied to a message but missing from the master list
-        still works, but Outlook shows it uncolored. Creating it here is what
-        makes DALYN's tags red.
+        still works, but Outlook shows it uncolored. The color is the whole
+        instruction to staff (yellow, red, green), so it has to be right.
 
-        Names are compared ignoring case, the way Outlook does. A category
-        that already exists in another color is left alone: someone chose
-        that color in that mailbox, and DALYN has no business changing it.
+        Names are compared ignoring case, the way Outlook does. A DALYN
+        category in the wrong color is corrected: the color is DALYN's to
+        decide, and the first tagging runs created them all red. Only names
+        passed in are looked at, so staff categories are never touched.
 
         Args:
             mailbox: SMTP address of the mailbox.
-            names: Category names DALYN is about to use.
-            color: Graph color preset for new categories, e.g. "preset0".
+            colors: {category name: Graph color preset}, e.g. ReviewTag.colors().
 
         Raises:
             SystemProblem: On 403 (MailboxSettings.ReadWrite missing) or any
@@ -433,23 +459,20 @@ class GraphClient:
         """
         url = self._mailbox_url(mailbox, "outlook/masterCategories")
         existing = {
-            category["displayName"].casefold(): category.get("color")
+            category["displayName"].casefold(): category
             for category in self._request("GET", url).json().get("value", [])
         }
 
-        for name in names:
+        for name, color in colors.items():
             current = existing.get(name.casefold())
             if current is None:
                 self._request("POST", url, json={"displayName": name, "color": color})
                 logger.info("%s: created category %r", mailbox, name)
-            elif current != color:
-                logger.warning(
-                    "%s: category %r already exists in %s, not %s. Leaving it as is.",
-                    mailbox,
-                    name,
-                    current,
-                    color,
-                )
+            elif current.get("color") != color:
+                # Only the color can change: Graph treats displayName as
+                # read-only once a category exists.
+                self._request("PATCH", f"{url}/{current['id']}", json={"color": color})
+                logger.info("%s: recolored category %r to %s", mailbox, name, color)
 
     def set_categories(self, mailbox: str, message_id: str, categories: list[str]) -> None:
         """Replace a message's categories with exactly this list.
@@ -469,3 +492,56 @@ class GraphClient:
         """
         url = self._mailbox_url(mailbox, f"messages/{message_id}")
         self._request("PATCH", url, gone_on_404=True, json={"categories": categories})
+
+    def get_move_target_id(self, mailbox: str, name: str) -> str:
+        """Return the ID of a folder DALYN may move mail into.
+
+        Only names on MOVE_TARGETS are accepted, checked before any request
+        is sent. A well-known name such as "deleteditems" is fetched
+        directly. "parent/child" is a folder found by its display name
+        inside the parent. DALYN never creates a folder: a missing one is a
+        setup step a person skipped, and the run stops to say so.
+
+        Args:
+            mailbox: SMTP address of the mailbox.
+            name: From config, e.g. "deleteditems" or "deleteditems/DALYN Completed".
+
+        Raises:
+            SystemProblem: If the name is not on MOVE_TARGETS, the folder
+                does not exist, or Graph fails.
+        """
+        key = name.strip().lower()
+        if key not in MOVE_TARGETS:
+            raise SystemProblem(f"Refusing request: {name!r} is not a folder DALYN may move into")
+
+        if "/" not in key:
+            url = self._mailbox_url(mailbox, f"mailFolders/{key}", folders=MOVE_TARGETS)
+            return self._request("GET", url, params={"$select": "id"}).json()["id"]
+
+        parent, child = name.strip().split("/", 1)
+        url = self._mailbox_url(mailbox, f"mailFolders/{parent.lower()}/childFolders", folders=MOVE_TARGETS)
+        # Graph string literals escape a quote by doubling it.
+        literal = child.strip().replace("'", "''")
+        found = self._request(
+            "GET", url, params={"$filter": f"displayName eq '{literal}'", "$select": "id"}
+        ).json().get("value", [])
+        if not found:
+            raise SystemProblem(
+                f"{mailbox} has no folder {child.strip()!r} inside {parent}. "
+                "Create it in Outlook first; DALYN does not create folders."
+            )
+        return found[0]["id"]
+
+    def move_message(self, mailbox: str, message_id: str, destination_id: str) -> None:
+        """Move one message into a folder from get_move_target_id.
+
+        Not retried on a gateway error, like every write here. If the move
+        went through and only the answer was lost, the message is simply not
+        in the source folder next pass, which is the outcome wanted anyway.
+
+        Raises:
+            MessageGone: If the message was deleted or purged meanwhile.
+            SystemProblem: On any other Graph failure.
+        """
+        url = self._mailbox_url(mailbox, f"messages/{message_id}/move")
+        self._request("POST", url, gone_on_404=True, json={"destinationId": destination_id})
