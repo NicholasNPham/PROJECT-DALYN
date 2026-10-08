@@ -649,15 +649,14 @@ def _write_csv(rows: list[dict], path: Path) -> None:
 def run_dry_run(config: dict, limit: int | None = None) -> int:
     """One pass over the source folder of every enabled mailbox, in file order.
 
-    Mailboxes are read one at a time to completion. The messages are not merged
-    into one list: nothing is gained by interleaving them, and oldest-first
-    resume is a per-mailbox cursor whenever it arrives.
+    Mailboxes are read one at a time to completion, each up to its own batch
+    size. The messages are not merged into one list: nothing is gained by
+    interleaving them.
 
     Args:
         config: From load_config.
-        limit: Tighten max_messages for this pass. Counted across all enabled
-            mailboxes, so --limit 1 is one email in total, from whichever
-            mailbox is listed first.
+        limit: Tighten max_messages_per_mailbox for this pass. Per mailbox
+            too, so --limit 1 is one email from each enabled mailbox.
 
     Raises:
         SystemProblem: Rules sheet, Graph or Tesseract failure, or five
@@ -685,18 +684,18 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
         allowed_mailboxes=config["enabled_mailboxes"],
     )
 
-    # max_messages bounds the whole pass, not each mailbox. The number exists
-    # to keep the pile of decisions a person checks by hand reasonable, and a
-    # reviewer does not care which mailbox a row came from. --limit tightens
-    # the same budget rather than introducing a second one.
-    budget = config["max_messages"]
+    # Per mailbox, not shared. A shared budget was worked in list order, so a
+    # busy first mailbox used all of it and the others went unread for as
+    # long as it stayed busy. --limit tightens the same number rather than
+    # introducing a second one.
+    batch_size = config["max_messages_per_mailbox"]
     if limit is not None:
-        budget = min(budget, limit)
+        batch_size = min(batch_size, limit)
 
     order = "newest first" if config["newest_first"] else "oldest first"
     logger.info(
-        "Dry run: up to %s message(s) across %s, %s",
-        budget,
+        "Dry run: up to %s message(s) from each of %s, %s",
+        batch_size,
         ", ".join(config["enabled_mailboxes"]),
         order,
     )
@@ -725,22 +724,13 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
         # nothing.
         with StacRunner(config) as runner:
             for mailbox in config["enabled_mailboxes"]:
-                remaining = budget - email_number
-                if remaining <= 0:
-                    logger.info(
-                        "Budget of %s message(s) is used up. %s was not read this pass.",
-                        budget,
-                        mailbox,
-                    )
-                    break
-
                 messages = client.list_messages(
                     mailbox,
                     days_back=config["days_back"],
-                    max_messages=remaining,
+                    max_messages=batch_size,
                     newest_first=config["newest_first"],
                     # Skipped in the listing rather than here, so handled
-                    # mail does not use up the budget. needs_handling lets
+                    # mail does not use up the batch. needs_handling lets
                     # interrupted emails through for the check below.
                     keep=needs_handling if actions["skip_tagged"] else None,
                 )
@@ -854,8 +844,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 logger.info("  %-8s %-13s %s", email_type, decision, count)
 
     # Which mailbox a pass actually got through. With one enabled this repeats
-    # the totals below; with three it is the only place the split shows, and
-    # the case worth catching is one busy mailbox eating the whole budget.
+    # the totals below; with three it is the only place the split shows.
     if len(config["enabled_mailboxes"]) > 1:
         per_mailbox = Counter(row["mailbox"] for row in rows)
         logger.info("Attachments by mailbox:")
@@ -947,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--limit",
         type=int,
-        help="Process only the first N messages (newest first in a dry run).",
+        help="Process at most N messages from each enabled mailbox.",
     )
     parser.add_argument(
         "--watch",

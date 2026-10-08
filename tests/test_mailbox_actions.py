@@ -23,7 +23,7 @@ VALID_CONFIG = {
     "source_folder": "deleteditems",
     "dry_run": True,
     "days_back": 2,
-    "max_messages": 5,
+    "max_messages_per_mailbox": 5,
     "newest_first": True,
     "stac": {"url": "https://stac-test.example.com", "is_test_instance": True},
     "mailbox_actions": {
@@ -75,6 +75,24 @@ def test_missing_switch_is_refused(tmp_path: Path) -> None:
     del config["mailbox_actions"]["skip_tagged"]
 
     with pytest.raises(SystemProblem, match="skip_tagged"):
+        _load(tmp_path, config)
+
+
+def test_old_max_messages_is_refused_with_new_name(tmp_path: Path) -> None:
+    """The old shared budget is named in the error along with what replaced it."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["max_messages"] = config.pop("max_messages_per_mailbox")
+
+    with pytest.raises(SystemProblem, match="max_messages_per_mailbox"):
+        _load(tmp_path, config)
+
+
+def test_old_and_new_budget_together_are_refused(tmp_path: Path) -> None:
+    """Leaving the old key beside the new one is refused, not quietly ignored."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["max_messages"] = 50
+
+    with pytest.raises(SystemProblem, match="'max_messages'"):
         _load(tmp_path, config)
 
 

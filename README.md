@@ -41,7 +41,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 178 tests, no network or live systems |
+| Tests | `pytest`, 186 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,
@@ -82,7 +82,7 @@ The Graph app registration needs `Mail.ReadWrite` and `MailboxSettings.ReadWrite
 
 **Usage**
 ```
-python main.py --limit 5     # one pass over at most 5 emails
+python main.py --limit 5     # one pass, at most 5 emails from each mailbox
 python main.py --watch 120   # a pass every 120 seconds until Ctrl+C
 python check_types.py        # check the rules sheet against the system's type list
 python -m pytest             # tests

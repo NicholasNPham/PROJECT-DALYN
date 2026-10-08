@@ -64,13 +64,12 @@ mailbox_actions:
 # Dry run window. Only mail received in the last N days is eligible.
 days_back: 2
 
-# Hard ceiling on how many emails one dry run pass touches. Sized so a
-# reviewer can check every decision by hand.
-max_messages: 50
-
-# Unused in the dry run. Belongs to the polling loop, which arrives with
-# dedup and STAC entry.
-max_emails_per_pass: 1
+# Most emails one pass takes from EACH enabled mailbox, so three mailboxes
+# at 10 is up to 30 a pass. Per mailbox so a busy one cannot leave the others
+# unread. This is also the batch tagged Queued up front, so keep it small
+# while staff share the folder. Live: 10. --limit lowers it for one run.
+# Formerly max_messages, a total for all mailboxes; that name is refused.
+max_messages_per_mailbox: 10
 
 # Newest first for testing, since recent mail is what staff can still verify.
 # Production reads oldest first.

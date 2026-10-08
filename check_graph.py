@@ -117,7 +117,7 @@ else:
 messages = client.list_messages(
     mailbox=ALL_MAILBOXES[0],
     days_back=config["days_back"],
-    max_messages=config["max_messages"],
+    max_messages=config["max_messages_per_mailbox"],
     newest_first=config["newest_first"],
 )
 

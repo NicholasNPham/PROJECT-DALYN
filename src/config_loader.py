@@ -25,7 +25,7 @@ REQUIRED_KEYS = (
     "source_folder",
     "dry_run",
     "days_back",
-    "max_messages",
+    "max_messages_per_mailbox",
     "newest_first",
     "stac",
     "mailbox_actions",
@@ -41,6 +41,13 @@ REQUIRED_STAC_KEYS = ("url",)
 MOVED_TO_CREDENTIAL_MANAGER = {
     "graph": ("client_secret",),
     "stac": ("username", "password"),
+}
+# Settings whose meaning changed, refused under the old name. max_messages
+# was one budget shared by every mailbox, so a busy first mailbox could use it
+# all and leave the others unread. Keeping the name with a new meaning would
+# triple a three-mailbox pass without anyone having decided that.
+RENAMED_KEYS = {
+    "max_messages": "max_messages_per_mailbox, which counts each mailbox separately",
 }
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 MAILBOX_KEYS = ("address", "enabled")
@@ -138,6 +145,12 @@ def _validate(config: dict, path: Path) -> None:
     Raises:
         SystemProblem: If a required key is missing or a value is unusable.
     """
+    # Before the missing-key check, so an old config.yaml is told what the
+    # setting became rather than only that a new one is missing.
+    for old, new in RENAMED_KEYS.items():
+        if old in config:
+            raise SystemProblem(f"Config key '{old}' at {path} is now {new}. Rename it.")
+
     missing = [key for key in REQUIRED_KEYS if key not in config]
     if missing:
         raise SystemProblem(f"Config at {path} is missing keys: {', '.join(missing)}")
@@ -156,7 +169,7 @@ def _validate(config: dict, path: Path) -> None:
 
     _validate_mailboxes(config, path)
 
-    for key in ("days_back", "max_messages"):
+    for key in ("days_back", "max_messages_per_mailbox"):
         value = config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise SystemProblem(f"Config key '{key}' must be a positive integer.")
