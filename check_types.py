@@ -32,8 +32,10 @@ from logger import setup_logging  # noqa: E402
 
 # Columns of STAC's export, by header name rather than position, since the
 # export is somebody else's file and its column order is not ours to rely on.
-TYPE_HEADER = "type"
-SUBTYPE_HEADER = "subtype"
+# The names differ between exports too: the full live list from the STAC
+# admin (Oct 2026) says "Image Type" and "Image Sub Type". First match wins.
+TYPE_HEADERS = ("type", "image type")
+SUBTYPE_HEADERS = ("subtype", "image sub type")
 DESCRIPTION_HEADER = "description"
 INACTIVE_HEADER = "inactive"
 
@@ -50,14 +52,14 @@ def load_stac_pairs(path: Path) -> dict[tuple[str, str], tuple[str, bool]]:
     except StopIteration:
         raise SystemProblem(f"{path} is empty.") from None
 
-    try:
-        type_at = header.index(TYPE_HEADER)
-        subtype_at = header.index(SUBTYPE_HEADER)
-    except ValueError:
+    type_at = next((header.index(name) for name in TYPE_HEADERS if name in header), None)
+    subtype_at = next((header.index(name) for name in SUBTYPE_HEADERS if name in header), None)
+    if type_at is None or subtype_at is None:
         raise SystemProblem(
-            f"{path} has no '{TYPE_HEADER}' and '{SUBTYPE_HEADER}' columns. "
+            f"{path} has no Type and Subtype columns (looked for "
+            f"{' or '.join(TYPE_HEADERS)}, and {' or '.join(SUBTYPE_HEADERS)}). "
             f"Found: {', '.join(h for h in header if h)}"
-        ) from None
+        )
 
     description_at = header.index(DESCRIPTION_HEADER) if DESCRIPTION_HEADER in header else None
     inactive_at = header.index(INACTIVE_HEADER) if INACTIVE_HEADER in header else None

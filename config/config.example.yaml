@@ -131,10 +131,9 @@ stac:
   # rule: on the right case, under a code a person reviews inside STAC.
   #
   # Leave review_type and review_subtype out to use PLS RVW / PLS RVW, one
-  # string with a space, in both columns. Test STAC has that pair. Live STAC
-  # does not have it switched on yet (checked 8 Oct 2026); it has to be
-  # enabled in live STAC before go-live, or every no-rule document fails
-  # there. check_types.py flags it while it is missing from the live export.
+  # string with a space, in both columns. Test and live STAC both have it
+  # (live enabled by the STAC admin, Oct 2026). check_types.py confirms it
+  # against whichever export paths.stac_types points at.
   #
   # Set both only to point a test instance at some other pair. Anything other
   # than PLS RVW / PLS RVW is refused when is_test_instance is false, since a
