@@ -48,8 +48,8 @@ source_folder: "deleteditems"
 # What DALYN does to an email it handles. All four are required.
 #
 #   tag_enabled   Adds "DALYN: ..." Outlook categories, keeping any staff
-#                 already set. Yellow while DALYN has the email (Queued,
-#                 Processing, Saving), red when filed, green when a person
+#                 already set. Red while DALYN has the email (Queued,
+#                 Processing, Saving) and when filed, green when a person
 #                 needs to look. Creates the categories the first time and
 #                 corrects their colors. Needs Mail.ReadWrite and
 #                 MailboxSettings.ReadWrite.

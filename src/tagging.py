@@ -3,8 +3,8 @@
 Kept out of main.py so the decision can be tested without importing the
 script that reads live mail.
 
-An email passes through the yellow tags in order: mark_queued tags the whole
-batch before any work starts, mark_processing the one being worked, and
+An email passes through the in-progress tags in order: mark_queued tags the
+whole batch before any work starts, mark_processing the one being worked, and
 mark_saving just before Save. tag_email then replaces them with the red or
 green result, and move_email takes filed mail out of the folder.
 """
@@ -43,9 +43,9 @@ STAC_FAILURE_TAGS = {
     StacResult.FAILED: ReviewTag.STAC_FAILED,
 }
 
-# Queued, Processing and Saving: DALYN still has the email. Read from the
-# colors so the two can never disagree about which tags are yellow.
-YELLOW_TAGS = frozenset(tag for tag, color in ReviewTag.colors().items() if color == ReviewTag.YELLOW_COLOR)
+# Queued, Processing and Saving: DALYN still has the email. By name, not by
+# color: they share red with Filed, and Filed must not come back through.
+IN_PROGRESS_TAGS = ReviewTag.in_progress()
 
 
 def categories_for(rows: list[dict]) -> list[str]:
@@ -108,13 +108,13 @@ def needs_handling(message: dict) -> bool:
     """True when skip_tagged should still let this email through.
 
     An email with no DALYN category has not been handled. One still carrying
-    a yellow tag was left mid-way by a run that stopped, and has to come
-    through too: to be redone, or for the interrupted check to see it.
-    Anything red or green has been dealt with.
+    Queued, Processing or Saving was left mid-way by a run that stopped, and
+    has to come through too: to be redone, or for the interrupted check to
+    see it. Any other DALYN tag (Filed, or a green reason) means dealt with.
     """
     categories = message.get("categories") or []
     dalyn = [category for category in categories if ReviewTag.is_dalyn(category)]
-    return not dalyn or any(category in YELLOW_TAGS for category in dalyn)
+    return not dalyn or any(category in IN_PROGRESS_TAGS for category in dalyn)
 
 
 def mark_queued(client: GraphClient, mailbox: str, messages: list[dict]) -> int:

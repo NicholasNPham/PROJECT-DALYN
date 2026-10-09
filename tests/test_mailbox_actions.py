@@ -314,16 +314,15 @@ def test_every_tag_carries_the_prefix() -> None:
 
 
 def test_colors_say_who_has_the_email() -> None:
-    """Yellow while DALYN has it, red when filed, green for a person."""
+    """Red while DALYN has it and when filed, green for a person."""
     colors = ReviewTag.colors()
 
     assert set(colors) == set(ReviewTag.all())
-    assert {tag for tag, color in colors.items() if color == ReviewTag.YELLOW_COLOR} == {
+    assert set(colors.values()) == {ReviewTag.RED_COLOR, ReviewTag.GREEN_COLOR}
+    assert {tag for tag, color in colors.items() if color == ReviewTag.RED_COLOR} == {
         ReviewTag.QUEUED,
         ReviewTag.PROCESSING,
         ReviewTag.SAVING,
-    }
-    assert {tag for tag, color in colors.items() if color == ReviewTag.RED_COLOR} == {
         ReviewTag.FILED,
         ReviewTag.NO_RULE,
     }

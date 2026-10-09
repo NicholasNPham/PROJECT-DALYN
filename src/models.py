@@ -23,19 +23,22 @@ class ReviewTag:
     attachment went in under the review pair. A Manual Review email gets one
     tag per distinct reason it was held back.
 
-    Colors tell staff who has the email: yellow, DALYN is on it and nobody
-    touches it; red, filed and done; green, a person needs to look. Staff
-    work the Inbox alongside DALYN, so the color is the whole instruction.
+    Colors tell staff what to do: red, DALYN has it or has filed it, so
+    nobody touches it; green, a person needs to look. Staff work the Inbox
+    alongside DALYN, so the color is the whole instruction. Filed mail leaves
+    the Inbox, so red there is nearly always an email DALYN is working on.
+
+    Which tags mean "still in progress" is in_progress(), never read from the
+    color: red covers both in progress and filed (Nick, 9 Oct 2026).
     """
 
     PREFIX = "DALYN: "
 
     # Graph's names for Outlook's category palette.
     RED_COLOR = "preset0"
-    YELLOW_COLOR = "preset3"
     GREEN_COLOR = "preset4"
 
-    # Yellow, in the order an email passes through them. The whole batch is
+    # In progress, in the order an email passes through them. The whole batch is
     # tagged QUEUED before DALYN starts on any of it, so staff know which
     # emails to leave alone. PROCESSING replaces it on the one email being
     # worked, and SAVING replaces that just before Save is pressed.
@@ -88,18 +91,24 @@ class ReviewTag:
         ]
 
     @classmethod
+    def in_progress(cls) -> frozenset[str]:
+        """The tags meaning DALYN still has the email: Queued, Processing, Saving.
+
+        A run that stopped can leave any of these behind, and such an email has
+        to come back through skip_tagged to be finished or held. Listed by name
+        so a color change can never strand one.
+        """
+        return frozenset({cls.QUEUED, cls.PROCESSING, cls.SAVING})
+
+    @classmethod
     def colors(cls) -> dict[str, str]:
         """Return {tag: Graph color} for every tag.
 
         Green unless listed otherwise, so a tag added later without a color
         decision shows as one a person must look at, not as done.
         """
-        yellow = {cls.QUEUED, cls.PROCESSING, cls.SAVING}
-        red = {cls.FILED, cls.NO_RULE}
-        return {
-            tag: cls.YELLOW_COLOR if tag in yellow else cls.RED_COLOR if tag in red else cls.GREEN_COLOR
-            for tag in cls.all()
-        }
+        red = cls.in_progress() | {cls.FILED, cls.NO_RULE}
+        return {tag: cls.RED_COLOR if tag in red else cls.GREEN_COLOR for tag in cls.all()}
 
     @classmethod
     def is_dalyn(cls, category: str) -> bool:

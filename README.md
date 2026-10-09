@@ -21,8 +21,8 @@ sure about.
    unreadable scan, or a defendant name that does not match, goes to a person
    instead. DALYN never guesses.
 7. Each email is labeled in Outlook by color, since staff work the same
-   Inbox. Yellow means DALYN has it and nobody should touch it. Red means
-   filed, and the email moves to Deleted Items. Green names what went wrong
+   Inbox. Red means DALYN has it or has filed it, so nobody should touch it;
+   filed email moves to Deleted Items. Green names what went wrong
    and the email stays in the Inbox for a person, who can fix the cause and
    clear the label to have DALYN try again.
 
@@ -41,7 +41,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 255 tests, no network or live systems |
+| Tests | `pytest`, 256 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,

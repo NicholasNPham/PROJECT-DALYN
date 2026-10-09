@@ -30,7 +30,7 @@ MOVE_TARGETS = frozenset({"deleteditems", "deleteditems/dalyn completed"})
 
 # Asks Graph for message IDs that survive a move. Staff work the same Inbox
 # as DALYN, and a default ID changes when someone drags the email to another
-# folder, which would leave DALYN unable to clear its yellow tag off it.
+# folder, which would leave DALYN unable to clear its in-progress tag off it.
 IMMUTABLE_ID = 'IdType="ImmutableId"'
 
 # How many messages to ask Graph for per page. Graph caps this at 1000 for
@@ -453,7 +453,7 @@ class GraphClient:
 
         A category applied to a message but missing from the master list
         still works, but Outlook shows it uncolored. The color is the whole
-        instruction to staff (yellow, red, green), so it has to be right.
+        instruction to staff (red, green), so it has to be right.
 
         Names are compared ignoring case, the way Outlook does. A DALYN
         category in the wrong color is corrected: the color is DALYN's to

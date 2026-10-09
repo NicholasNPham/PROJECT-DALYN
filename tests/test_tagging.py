@@ -282,8 +282,8 @@ def test_untagged_email_needs_handling() -> None:
     assert needs_handling({"categories": ["Staff category"]})
 
 
-def test_red_or_green_email_is_skipped() -> None:
-    """A result tag means DALYN is done with it."""
+def test_result_tags_are_skipped() -> None:
+    """Filed or a green reason means DALYN is done with it."""
     assert not needs_handling({"categories": [ReviewTag.FILED]})
     assert not needs_handling({"categories": [ReviewTag.READY_TO_SAVE]})
     assert not needs_handling({"categories": ["Staff category", ReviewTag.NO_UCN]})
@@ -291,9 +291,18 @@ def test_red_or_green_email_is_skipped() -> None:
 
 
 @pytest.mark.parametrize("tag", [ReviewTag.QUEUED, ReviewTag.PROCESSING, ReviewTag.SAVING])
-def test_yellow_email_left_by_a_crash_comes_through(tag: str) -> None:
-    """A run that stopped mid-batch must not strand its yellow emails."""
+def test_in_progress_email_left_by_a_crash_comes_through(tag: str) -> None:
+    """A run that stopped mid-batch must not strand its Queued, Processing or Saving emails."""
     assert needs_handling({"categories": ["Staff category", tag]})
+
+
+def test_in_progress_is_decided_by_name_not_color() -> None:
+    """In progress and Filed are both red; only the in-progress ones come back."""
+    from models import ReviewTag as Tag
+
+    assert Tag.colors()[Tag.QUEUED] == Tag.colors()[Tag.FILED]
+    assert needs_handling({"categories": [Tag.QUEUED]})
+    assert not needs_handling({"categories": [Tag.FILED]})
 
 
 # Fake Graph for queueing, saving and moving
@@ -342,7 +351,7 @@ class FakeGraph:
 
 
 def test_whole_batch_is_queued_keeping_staff_categories() -> None:
-    """Every email goes yellow before any work, and staff tags stay."""
+    """Every email goes Queued before any work, and staff tags stay."""
     client = FakeGraph()
     messages = [{"id": "m1", "categories": ["Staff category"]}, {"id": "m2"}]
 

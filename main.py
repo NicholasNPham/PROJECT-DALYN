@@ -3,7 +3,7 @@
 One pass over the source folder of every enabled mailbox, up to a batch per
 mailbox. Reads, OCRs, classifies, takes each email as far into STAC as the
 stac switches allow, and logs. With mailbox_actions.tag_enabled it also puts
-"DALYN: ..." Outlook categories on each email: yellow while DALYN has it, red
+"DALYN: ..." Outlook categories on each email: red while DALYN has it and
 when filed, green when a person needs to look. With move_enabled, filed mail
 moves to the done folder and everything else stays where it is.
 
@@ -789,7 +789,7 @@ def run_pass(config: dict, limit: int | None = None) -> int:
                     # Before the first email, so a missing MailboxSettings
                     # permission stops the pass before any work is done.
                     client.ensure_categories(mailbox, ReviewTag.colors())
-                    # The whole batch goes yellow before DALYN starts on any
+                    # The whole batch goes red Queued before DALYN starts on any
                     # of it, so staff sharing the folder know to leave it.
                     mark_queued(client, mailbox, messages)
 
