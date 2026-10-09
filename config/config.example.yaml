@@ -1,4 +1,9 @@
 # Copy to config.yaml and fill in. config.yaml is gitignored, never commit it.
+#
+# Two machines, two config files. The values below are for the DEV machine:
+# Deleted Items standing in for the Inbox, test STAC. The LIVE machine's
+# config.yaml uses the values marked "Live:" and is never edited for testing.
+# Test on the dev machine, push, then git pull on the live machine.
 
 # Microsoft Graph app registration. Identifiers only: the client secret lives
 # in Windows Credential Manager. Run set_credentials.py once per machine.
@@ -18,22 +23,27 @@ rbac_control_mailbox: ""
 # merely skipped, so this is where a mailbox is genuinely held back until its
 # access is approved. Enable one at a time.
 mailboxes:
-  - address: "mailbox@example.com"
+  - address: "mailbox1@example.com"
     enabled: false
-  - address: "mailbox@example.com"
+  - address: "mailbox2@example.com"
     enabled: true
-  - address: "mailbox@example.com"
+  - address: "mailbox3@example.com"
+    enabled: false
+  - address: "mailbox4@example.com"
+    enabled: false
+  - address: "mailbox5@example.com"
     enabled: false
 
-# Which folder to read. Also hardcoded in graph_client.ALLOWED_FOLDERS as a
-# second gate, so changing this alone will not move DALYN to the Inbox.
-# Going to production requires a code change, on purpose.
+# Which folder to read: "inbox" or "deleteditems", the only two in
+# graph_client.ALLOWED_FOLDERS. Live: "inbox". Dev: "deleteditems", standing
+# in for the Inbox. Two pairings are refused at startup, because each is the
+# leftover of switching a machine between testing and live:
+#   inbox with tag_enabled while stac.is_test_instance is true
+#   deleteditems with upload_enabled while stac.is_test_instance is false
+# What a run does is set by the stac and mailbox_actions switches below.
+# There is no dry_run setting any more; an old config.yaml that still has one
+# is refused, so delete the line.
 source_folder: "deleteditems"
-
-# Dry run: must stay true, this build refuses to start otherwise. What a dry
-# run does to STAC and to the mailbox is set by the stac and mailbox_actions
-# switches below.
-dry_run: true
 
 # What DALYN does to an email it handles. All four are required.
 #
@@ -49,7 +59,7 @@ dry_run: true
 #   skip_tagged   true skips any email with a red or green DALYN tag, which
 #                 is how live running avoids filing an email twice. Clearing
 #                 a green tag hands the email back to DALYN. false handles
-#                 everything again every pass, for repeat testing.
+#                 everything again every pass, for repeat testing. Live: true.
 #   done_folder   Required even while moving is off. Live: "deleteditems".
 #                 Testing: "deleteditems/DALYN Completed", a folder made by
 #                 hand inside Deleted Items, standing in for Deleted Items
@@ -61,7 +71,20 @@ mailbox_actions:
   skip_tagged: false
   done_folder: "deleteditems/DALYN Completed"
 
-# Dry run window. Only mail received in the last N days is eligible.
+# Email when a run stops, and again when runs work again. One email per
+# outage, not one per run. Needs Mail.Send on the app registration, and
+# Exchange's scope must let the app send as send_from. DALYN can send from
+# send_from but never reads it. All three keys are required; the addresses
+# may stay blank while enabled is false. It cannot report a failed Graph
+# sign-in (an expired client secret), since it sends through Graph too, so
+# keep a calendar reminder before the secret expires.
+alerts:
+  enabled: false
+  send_from: ""
+  send_to: ""
+
+# Only mail received in the last N days is read. Live: 7, so mail from Friday
+# evening is still in reach on Monday, or after a long weekend.
 days_back: 2
 
 # Most emails one pass takes from EACH enabled mailbox, so three mailboxes
@@ -72,14 +95,13 @@ days_back: 2
 max_messages_per_mailbox: 10
 
 # Newest first for testing, since recent mail is what staff can still verify.
-# Production reads oldest first.
+# Live: false, oldest first, since the oldest email has waited longest.
 newest_first: true
 
-# STAC. Point this at TEST STAC until a live run is deliberately approved.
-# is_test_instance is a second gate, the same idea as source_folder: DALYN
-# checks the url looks like a test instance and refuses to save anything if
-# this says true but the url does not. Set it to false only when a live run
-# is intended, and expect to change code as well.
+# STAC. Dev: test STAC. Live: the live url with is_test_instance false.
+# is_test_instance has to agree with the url: DALYN refuses to start if this
+# says true but the url does not look like a test instance. The login in
+# Credential Manager is the same account for both.
 stac:
   url: "https://stac-test.example.com"
   # username and password live in Windows Credential Manager, not here.
@@ -100,7 +122,7 @@ stac:
   #       Presses Save. Documents go onto cases.
   #
   # save_enabled without upload_enabled is refused: there would be nothing
-  # to save.
+  # to save. Live: both true.
   upload_enabled: false
   save_enabled: false
 
@@ -151,3 +173,7 @@ paths:
   stac_types: "Path/to/Image_Types_SubTypes.xlsx"
   # chromedriver.exe. Leave blank to let webdriver_manager fetch one.
   chromedriver: ""
+  # tesseract.exe. Blank relies on PATH, but the usual Windows installer puts
+  # it in C:\Program Files\Tesseract-OCR and does not add that to PATH, so
+  # set it on every machine. A run stops at startup if Tesseract is missing.
+  tesseract: ""

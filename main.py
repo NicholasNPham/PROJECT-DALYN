@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 # src/ modules import each other flat (from exceptions import ...), so the
 # path insert above has to run before any of these.
 import classifier  # noqa: E402
+from alert import report_failure, report_success  # noqa: E402
 import ocr  # noqa: E402
 import ucn  # noqa: E402
 from config_loader import load_config  # noqa: E402
@@ -678,7 +679,7 @@ def _log_mailbox_table(
         )
 
 
-def run_dry_run(config: dict, limit: int | None = None) -> int:
+def run_pass(config: dict, limit: int | None = None) -> int:
     """One pass over the source folder of every enabled mailbox, in file order.
 
     Mailboxes are read one at a time to completion, each up to its own batch
@@ -726,8 +727,9 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
     order = "newest first" if config["newest_first"] else "oldest first"
     logger.info(
-        "Dry run: up to %s message(s) from each of %s, %s",
+        "Pass: up to %s message(s) from %s of each of %s, %s",
         batch_size,
+        config["source_folder"],
         ", ".join(config["enabled_mailboxes"]),
         order,
     )
@@ -763,6 +765,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
                 messages = client.list_messages(
                     mailbox,
                     days_back=config["days_back"],
+                    folder=config["source_folder"],
                     max_messages=batch_size,
                     newest_first=config["newest_first"],
                     # Skipped in the listing rather than here, so handled
@@ -867,9 +870,14 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
         # Real case documents. Gone whether the pass finished or crashed.
         shutil.rmtree(work_dir, ignore_errors=True)
         # Written even on a crash, so a failure at message 40 still leaves
-        # 39 messages of results to look at.
-        _write_csv(rows, csv_path)
-        logger.info("Wrote %s row(s) to %s", len(rows), csv_path)
+        # 39 messages of results to look at. Not written when there is
+        # nothing in it: live runs every 15 minutes, and most passes find no
+        # new mail, so the folder would fill with header-only files.
+        if rows:
+            _write_csv(rows, csv_path)
+            logger.info("Wrote %s row(s) to %s", len(rows), csv_path)
+        else:
+            logger.info("No emails this pass, so no CSV written")
 
     # One entry per email: its first row carries the email-level fields.
     emails = [row for row in rows if not row["attachment"] or row["attachment"].startswith("1 of ")]
@@ -927,7 +935,7 @@ def run_dry_run(config: dict, limit: int | None = None) -> int:
 
 
 def _watch(config: dict, limit: int | None, interval: int) -> int:
-    """Run a dry-run pass every `interval` seconds until Ctrl+C.
+    """Run a pass every `interval` seconds until Ctrl+C.
 
     Unless mailbox_actions.skip_tagged is on, an email still in the source
     folder is read again every pass. With it on, an email DALYN has tagged is
@@ -938,6 +946,7 @@ def _watch(config: dict, limit: int | None, interval: int) -> int:
 
     A failed credential stops the watch at once. Any other SystemProblem is
     logged and retried next pass, up to MAX_CONSECUTIVE_FAILURES in a row.
+    The alert email follows each pass the same way it follows a single run.
     """
     failures = 0
     pass_number = 0
@@ -948,13 +957,15 @@ def _watch(config: dict, limit: int | None, interval: int) -> int:
             pass_number += 1
             logger.info("===== Pass %s =====", pass_number)
             try:
-                run_dry_run(config, limit=limit)
+                run_pass(config, limit=limit)
                 failures = 0
+                report_success(config)
             except GraphAuthError:
                 raise
             except SystemProblem as error:
                 failures += 1
                 logger.error("Pass %s failed (%s in a row): %s", pass_number, failures, error)
+                report_failure(config, error)
                 if failures >= MAX_CONSECUTIVE_FAILURES:
                     logger.error("Stopping after %s failed passes in a row", failures)
                     return EXIT_SYSTEM_PROBLEM
@@ -967,7 +978,9 @@ def _watch(config: dict, limit: int | None, interval: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="DALYN dry run over Deleted Items.")
+    parser = argparse.ArgumentParser(
+        description="One DALYN pass over config.source_folder of each enabled mailbox."
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -1005,29 +1018,30 @@ def main(argv: list[str] | None = None) -> int:
             PLS_RVW_SUBTYPE,
         )
 
-    if not config["dry_run"]:
-        logger.error(
-            "dry_run is false in config.yaml, but this build can only dry run. "
-            "Refusing to start rather than let anyone think it went live."
-        )
-        return EXIT_CONFIG_PROBLEM
-
     try:
         ocr.configure_tesseract(config["paths"].get("tesseract"))
         if args.watch is None:
-            return run_dry_run(config, limit=args.limit)
+            result = run_pass(config, limit=args.limit)
+            report_success(config)
+            return result
         return _watch(config, args.limit, args.watch)
     except GraphAuthError as error:
         logger.error("Graph sign-in failed. Check the client secret has not expired. %s", error)
+        # Tried anyway, though it goes through the same sign-in and will
+        # likely fail too. It costs nothing and covers a one-off refusal.
+        report_failure(config, error)
         return EXIT_SYSTEM_PROBLEM
     except SystemProblem as error:
         logger.error("Stopped: %s", error)
+        report_failure(config, error)
         return EXIT_SYSTEM_PROBLEM
     except KeyboardInterrupt:
+        # A person stopped it on purpose, so nobody needs telling.
         logger.warning("Interrupted by user")
         return EXIT_SYSTEM_PROBLEM
-    except Exception:
+    except Exception as error:
         logger.exception("Unexpected error. This is a bug, not a document problem.")
+        report_failure(config, error)
         return EXIT_SYSTEM_PROBLEM
 
 

@@ -13,7 +13,7 @@ from logger import get_logger
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 
-ALLOWED_FOLDERS = frozenset({"deleteditems"})
+ALLOWED_FOLDERS = frozenset({"deleteditems", "inbox"})
 
 # Folders DALYN may move mail INTO, compared ignoring case. Kept apart from
 # ALLOWED_FOLDERS on purpose: that list is where DALYN reads from, and adding
@@ -66,6 +66,7 @@ class GraphClient:
         client_id: str,
         client_secret: str,
         allowed_mailboxes: list[str],
+        alert_sender: str | None = None,
     ) -> None:
         """Build the MSAL client. Does not contact Microsoft until a token is requested.
 
@@ -74,6 +75,9 @@ class GraphClient:
             client_id: Application (client) ID from the app registration.
             client_secret: The secret Value, not the Secret ID.
             allowed_mailboxes: SMTP addresses DALYN is permitted to touch.
+            alert_sender: The one address send_mail may send from. Kept out
+                of allowed_mailboxes, so DALYN can send from it but never
+                read it. None means send_mail refuses everything.
 
         Raises:
             GraphAuthError: If MSAL rejects the credentials as malformed.
@@ -91,6 +95,7 @@ class GraphClient:
         self._allowed_mailboxes = frozenset(
             mailbox.strip().lower() for mailbox in allowed_mailboxes
         )
+        self._alert_sender = alert_sender.strip().lower() if alert_sender else None
 
         logger.debug("MSAL client built for tenant %s", tenant_id)
 
@@ -204,7 +209,7 @@ class GraphClient:
                     f"Graph refused {method} with 403. The app registration is "
                     "probably missing a permission: Mail.Read for reading, "
                     "Mail.ReadWrite for tagging, MailboxSettings.ReadWrite for "
-                    "creating categories. Or Exchange's mailbox scope does not "
+                    "creating categories, Mail.Send for alerts. Or Exchange's mailbox scope does not "
                     f"cover this mailbox. {response.text[:200]}"
                 )
 
@@ -258,11 +263,13 @@ class GraphClient:
             self,
             mailbox: str,
             days_back: int,
+            *,
+            folder: str,
             max_messages: int | None = None,
             newest_first: bool = True,
             keep: Callable[[dict], bool] | None = None,
     ) -> list[dict]:
-        """Return messages from the source folder, following Graph's paging.
+        """Return messages from one folder, following Graph's paging.
 
         Graph never returns a whole folder at once. It answers with one page
         and, when there is more, an @odata.nextLink to continue from. This
@@ -277,6 +284,10 @@ class GraphClient:
         Args:
             mailbox: SMTP address of the mailbox to read.
             days_back: Only consider mail received within this many days.
+            folder: Well-known folder name from config.source_folder, such as
+                inbox or deleteditems. Required, with no default, so no caller
+                reads a folder it did not name. ALLOWED_FOLDERS still decides
+                whether the read is allowed at all.
             max_messages: Stop after this many. None means the whole folder,
                 which is what production wants: the Inbox is the work queue,
                 and anything left in it is unprocessed.
@@ -301,7 +312,7 @@ class GraphClient:
 
         direction = "desc" if newest_first else "asc"
 
-        url = self._mailbox_url(mailbox, "mailFolders/deleteditems/messages")
+        url = self._mailbox_url(mailbox, f"mailFolders/{folder}/messages")
         params = {
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
@@ -545,3 +556,27 @@ class GraphClient:
         """
         url = self._mailbox_url(mailbox, f"messages/{message_id}/move")
         self._request("POST", url, gone_on_404=True, json={"destinationId": destination_id})
+
+    def send_mail(self, sender: str, to: str, subject: str, body: str) -> None:
+        """Send one plain-text email, for alerts. Needs Mail.Send.
+
+        Only from the alert_sender given at construction, and only this one
+        call: the URL is built here rather than by _mailbox_url, so the sender
+        never joins the mailboxes DALYN may read or tag. Not kept in Sent
+        Items, since the sender is a person's own mailbox.
+
+        Raises:
+            SystemProblem: If sender is not the configured alert sender, or
+                Graph refuses (403 when Mail.Send or Exchange scope is missing).
+        """
+        normalized = sender.strip().lower()
+        if not self._alert_sender or normalized != self._alert_sender:
+            raise SystemProblem(f"Refusing to send mail from {sender}: not the configured alert sender")
+
+        message = {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": to.strip()}}],
+        }
+        url = f"{GRAPH_BASE_URL}/users/{normalized}/sendMail"
+        self._request("POST", url, json={"message": message, "saveToSentItems": False})

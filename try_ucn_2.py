@@ -30,6 +30,7 @@ print(f"Reading {mailbox}")
 messages = client.list_messages(
     mailbox=mailbox,
     days_back=config["days_back"],
+    folder=config["source_folder"],
     max_messages=config["max_messages_per_mailbox"],
     newest_first=config["newest_first"],
 )

@@ -13,7 +13,7 @@ import yaml
 
 from credential import load_credentials
 from exceptions import SystemProblem
-from graph_client import MOVE_TARGETS
+from graph_client import ALLOWED_FOLDERS, MOVE_TARGETS
 from logger import get_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -23,12 +23,12 @@ REQUIRED_KEYS = (
     "graph",
     "mailboxes",
     "source_folder",
-    "dry_run",
     "days_back",
     "max_messages_per_mailbox",
     "newest_first",
     "stac",
     "mailbox_actions",
+    "alerts",
     "paths",
 )
 REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id")
@@ -49,6 +49,13 @@ MOVED_TO_CREDENTIAL_MANAGER = {
 RENAMED_KEYS = {
     "max_messages": "max_messages_per_mailbox, which counts each mailbox separately",
 }
+# Settings that no longer do anything, refused so nobody sets one believing
+# it protects them. dry_run was a lock that refused to start when false; the
+# stac and mailbox_actions switches have said what a run does ever since.
+RETIRED_KEYS = {
+    "dry_run": "stac.upload_enabled, stac.save_enabled and mailbox_actions say "
+    "what a run does",
+}
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 MAILBOX_KEYS = ("address", "enabled")
 # What DALYN may do to a message once it has handled it. All three are
@@ -56,6 +63,9 @@ MAILBOX_KEYS = ("address", "enabled")
 MAILBOX_ACTION_KEYS = ("tag_enabled", "move_enabled", "skip_tagged")
 # Where moved mail goes: filed mail, and mail a person must handle.
 MOVE_FOLDER_KEYS = ("done_folder",)
+# The email sent when a run stops. All three are required even while it is
+# off, so turning it on is one switch, like done_folder.
+ALERT_KEYS = ("enabled", "send_from", "send_to")
 
 # A url is treated as a test instance only if one of these appears in it.
 # Deliberately crude: the point is that a plain production url cannot be
@@ -118,11 +128,11 @@ def load_config(config_path: Path | None = None, with_credentials: bool = True) 
 
     stac = config["stac"]
     logger.info(
-        "Config loaded from %s (dry_run=%s, mailboxes=%s of %s enabled: %s, "
+        "Config loaded from %s (source=%s, mailboxes=%s of %s enabled: %s, "
         "stac=%s, test=%s, upload=%s, save=%s, tag=%s, move=%s, skip_tagged=%s, "
-        "secrets=%s)",
+        "alerts=%s, secrets=%s)",
         path,
-        config["dry_run"],
+        config["source_folder"],
         len(config["enabled_mailboxes"]),
         len(config["mailboxes"]),
         ", ".join(config["enabled_mailboxes"]),
@@ -133,6 +143,7 @@ def load_config(config_path: Path | None = None, with_credentials: bool = True) 
         config["mailbox_actions"]["tag_enabled"],
         config["mailbox_actions"]["move_enabled"],
         config["mailbox_actions"]["skip_tagged"],
+        config["alerts"]["enabled"],
         "Credential Manager" if with_credentials else "not loaded",
     )
 
@@ -150,6 +161,11 @@ def _validate(config: dict, path: Path) -> None:
     for old, new in RENAMED_KEYS.items():
         if old in config:
             raise SystemProblem(f"Config key '{old}' at {path} is now {new}. Rename it.")
+    for old, instead in RETIRED_KEYS.items():
+        if old in config:
+            raise SystemProblem(
+                f"Config key '{old}' at {path} is no longer used: {instead}. Delete it."
+            )
 
     missing = [key for key in REQUIRED_KEYS if key not in config]
     if missing:
@@ -174,9 +190,17 @@ def _validate(config: dict, path: Path) -> None:
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise SystemProblem(f"Config key '{key}' must be a positive integer.")
 
-    for key in ("dry_run", "newest_first"):
-        if not isinstance(config[key], bool):
-            raise SystemProblem(f"Config key '{key}' must be true or false.")
+    if not isinstance(config["newest_first"], bool):
+        raise SystemProblem("Config key 'newest_first' must be true or false.")
+
+    # Checked here as well as in graph_client, so a typo stops the run at
+    # startup instead of after Chrome has opened and signed in to STAC.
+    source = str(config["source_folder"]).strip().lower()
+    if source not in ALLOWED_FOLDERS:
+        raise SystemProblem(
+            f"Config 'source_folder' is {config['source_folder']!r}. DALYN reads only "
+            f"{', '.join(sorted(ALLOWED_FOLDERS))}."
+        )
 
     stac = config["stac"]
     if not isinstance(stac, dict):
@@ -229,12 +253,13 @@ def _validate(config: dict, path: Path) -> None:
 
     _validate_review_pair(stac)
     _validate_mailbox_actions(config["mailbox_actions"])
+    _validate_alerts(config["alerts"])
 
     # Staff and DALYN share the Inbox. A filed email left there carries only
     # its red tag, and a person who clears that tag hands it back to DALYN,
     # which files it again. Moving it out is what makes that impossible.
     if (
-        str(config["source_folder"]).strip().lower() == "inbox"
+        source == "inbox"
         and stac.get("save_enabled")
         and not config["mailbox_actions"]["move_enabled"]
     ):
@@ -244,6 +269,8 @@ def _validate(config: dict, path: Path) -> None:
             "Inbox where it could be filed twice. Turn moving on, or Save off."
         )
 
+    _refuse_test_live_mix(source, stac, config["mailbox_actions"])
+
     paths = config["paths"]
     if not isinstance(paths, dict):
         raise SystemProblem("Config key 'paths' must be a mapping.")
@@ -251,6 +278,41 @@ def _validate(config: dict, path: Path) -> None:
     missing_paths = [key for key in PATH_KEYS if not paths.get(key)]
     if missing_paths:
         raise SystemProblem(f"Config 'paths' is missing: {', '.join(missing_paths)}")
+
+
+def _refuse_test_live_mix(source: str, stac: dict, actions: dict) -> None:
+    """Refuse the two ways of pairing real mail with the wrong STAC.
+
+    Both come from switching one machine between testing and live and
+    leaving one setting behind.
+
+    Raises:
+        SystemProblem: If the live Inbox is tagged while documents go to test
+            STAC, or Deleted Items is uploaded into live STAC.
+    """
+    is_test = stac.get("is_test_instance", True)
+
+    # The tags and the move would tell staff an email was filed, and send it
+    # to Deleted Items, when the document only reached test STAC. Reading the
+    # Inbox against test STAC with tagging off writes nothing to the mailbox,
+    # so it stays allowed for checking the Inbox listing.
+    if source == "inbox" and is_test and actions["tag_enabled"]:
+        raise SystemProblem(
+            "Config reads the Inbox and tags it, but stac.is_test_instance is true. "
+            "Live mail would be tagged Filed and moved while its documents went to "
+            "test STAC. Point stac at live STAC, or turn tag_enabled off."
+        )
+
+    # Deleted Items is mail staff already finished, the testing stand-in for
+    # the Inbox. Uploading it into live STAC would file real documents a
+    # second time. Reading it against live with upload off (a check that
+    # cases exist) stays allowed.
+    if source == "deleteditems" and not is_test and stac.get("upload_enabled"):
+        raise SystemProblem(
+            "Config reads Deleted Items and uploads to live STAC. That mail is "
+            "already finished and would be filed twice. Set source_folder to inbox, "
+            "or upload_enabled false."
+        )
 
 
 def _validate_mailbox_actions(actions: dict) -> None:
@@ -291,6 +353,38 @@ def _validate_mailbox_actions(actions: dict) -> None:
             "Config has mailbox_actions.move_enabled true but tag_enabled false. "
             "Moved mail must carry its result tag. Turn tagging on, or moving off."
         )
+
+
+def _validate_alerts(alerts: dict) -> None:
+    """Check the alert email settings, and strip the two addresses.
+
+    While enabled is false the addresses may be blank, since nothing is sent.
+    Once it is true both must look like addresses: an alert that cannot be
+    sent is found out at startup, not on the day something breaks.
+
+    Raises:
+        SystemProblem: If the section is not a mapping, a key is missing,
+            enabled is not a boolean, or enabled is true without both
+            addresses.
+    """
+    if not isinstance(alerts, dict):
+        raise SystemProblem("Config key 'alerts' must be a mapping.")
+
+    missing = [key for key in ALERT_KEYS if key not in alerts]
+    if missing:
+        raise SystemProblem(f"Config 'alerts' is missing: {', '.join(missing)}")
+
+    if not isinstance(alerts["enabled"], bool):
+        raise SystemProblem("Config key 'alerts.enabled' must be true or false.")
+
+    for key in ("send_from", "send_to"):
+        value = alerts[key]
+        alerts[key] = value.strip() if isinstance(value, str) else ""
+        if alerts["enabled"] and "@" not in alerts[key]:
+            raise SystemProblem(
+                f"Config has alerts.enabled true but alerts.{key} is not an email "
+                "address. Fill it in, or turn alerts off."
+            )
 
 
 def _refuse_stored_secrets(config: dict, path: Path) -> None:

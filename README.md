@@ -41,7 +41,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 189 tests, no network or live systems |
+| Tests | `pytest`, 221 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,
@@ -78,13 +78,26 @@ stopping before Save:
 4. Run `python set_credentials.py` to store the Graph secret and the
    case management login in Windows Credential Manager.
 
-The Graph app registration needs `Mail.ReadWrite` and `MailboxSettings.ReadWrite`.
+The Graph app registration needs `Mail.ReadWrite` and `MailboxSettings.ReadWrite`,
+plus `Mail.Send` for alert emails.
+
+**Two machines.** A dev machine reads Deleted Items as a stand-in for the
+Inbox and files to the test system. A dedicated live machine reads the Inbox
+and files to the live system, and its `config.yaml` is never edited for
+testing. Changes are tested on dev, pushed, then pulled on live with
+`git pull`.
+
+**Running live.** Windows Task Scheduler runs `python main.py` from the
+project folder every 15 minutes, with "Do not start a new instance" so runs
+never overlap, and "Run only when user is logged on" because the browser is
+a visible window. Each run takes up to `max_messages_per_mailbox` emails
+from each enabled mailbox, oldest first.
 
 **Usage**
 ```
 python main.py --limit 5     # one pass, at most 5 emails from each mailbox
 python main.py --watch 120   # a pass every 120 seconds until Ctrl+C
-python check_types.py        # check the rules sheet against the system's type list
+python check_types.py        # check the config and the rules sheet against the system's type list
 python -m pytest             # tests
 ```
 
@@ -92,6 +105,7 @@ python -m pytest             # tests
 
 | Setting | Controls |
 |---|---|
+| `source_folder` | `inbox` live, `deleteditems` on dev; reading the Inbox with tagging on the test system, or uploading Deleted Items to live, is refused |
 | `mailboxes[].enabled` | Which mailboxes are reachable at all |
 | `stac.is_test_instance` | Must match the URL, or DALYN refuses to start |
 | `stac.upload_enabled` | Upload, stopping before Save |
@@ -99,3 +113,4 @@ python -m pytest             # tests
 | `mailbox_actions.tag_enabled` | Label handled emails in Outlook |
 | `mailbox_actions.skip_tagged` | Skip emails already labeled |
 | `mailbox_actions.move_enabled` | Move filed emails to `done_folder`; needs `tag_enabled`, and is required when reading the Inbox with Save on |
+| `alerts.enabled` | Email one person when a run stops, once per outage, and again when it recovers |

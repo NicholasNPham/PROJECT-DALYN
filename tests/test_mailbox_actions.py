@@ -12,16 +12,16 @@ import yaml
 
 from config_loader import load_config
 from exceptions import MessageGone, SystemProblem
-from graph_client import GraphClient
+from graph_client import ALLOWED_FOLDERS, GraphClient
 from models import ReviewTag
 
 MAILBOX = "dalyn-test@example.com"
+ALERT_SENDER = "alerts@example.com"
 
 VALID_CONFIG = {
     "graph": {"tenant_id": "placeholder-tenant", "client_id": "placeholder-client"},
     "mailboxes": [{"address": MAILBOX, "enabled": True}],
     "source_folder": "deleteditems",
-    "dry_run": True,
     "days_back": 2,
     "max_messages_per_mailbox": 5,
     "newest_first": True,
@@ -32,6 +32,7 @@ VALID_CONFIG = {
         "skip_tagged": False,
         "done_folder": "deleteditems/DALYN Completed",
     },
+    "alerts": {"enabled": False, "send_from": "", "send_to": ""},
     "paths": {"logs": "logs", "temp": "temp", "excel": "rules.xlsx", "stac_types": "types.xlsx"},
 }
 
@@ -146,10 +147,12 @@ def test_old_review_folder_key_is_not_needed(tmp_path: Path) -> None:
 
 
 def _live_like(save: bool, move: bool) -> dict:
-    """The valid config reading the Inbox, with Save and moving as given."""
+    """The valid config reading the Inbox into live STAC, with Save and moving as given."""
     config = _config_with(move_enabled=move)
     config["source_folder"] = "inbox"
-    config["stac"].update(upload_enabled=True, save_enabled=save)
+    config["stac"].update(
+        url="https://stac.example.com", is_test_instance=False, upload_enabled=True, save_enabled=save
+    )
     return config
 
 
@@ -173,6 +176,106 @@ def test_deleted_items_with_save_and_no_moving_is_allowed(tmp_path: Path) -> Non
     config["stac"].update(upload_enabled=True, save_enabled=True)
 
     assert _load(tmp_path, config)["stac"]["save_enabled"] is True
+
+
+def test_tagging_the_inbox_against_test_stac_is_refused(tmp_path: Path) -> None:
+    """Live mail must not go red Filed while its documents went to test STAC."""
+    config = _config_with()
+    config["source_folder"] = "inbox"
+
+    with pytest.raises(SystemProblem, match="test STAC"):
+        _load(tmp_path, config)
+
+
+def test_reading_the_inbox_against_test_stac_untagged_is_allowed(tmp_path: Path) -> None:
+    """Checking the Inbox listing writes nothing to the mailbox, so it may use test STAC."""
+    config = _config_with(tag_enabled=False)
+    config["source_folder"] = "inbox"
+
+    assert _load(tmp_path, config)["source_folder"] == "inbox"
+
+
+def test_uploading_deleted_items_into_live_stac_is_refused(tmp_path: Path) -> None:
+    """Deleted Items is finished mail; uploading it to live would file it twice."""
+    config = _live_like(save=False, move=False)
+    config["source_folder"] = "deleteditems"
+
+    with pytest.raises(SystemProblem, match="filed twice"):
+        _load(tmp_path, config)
+
+
+def test_reading_deleted_items_against_live_stac_without_upload_is_allowed(tmp_path: Path) -> None:
+    """The live read-only check: cases are looked up, nothing is sent."""
+    config = _live_like(save=False, move=False)
+    config["source_folder"] = "deleteditems"
+    config["stac"]["upload_enabled"] = False
+    config["mailbox_actions"]["tag_enabled"] = False
+
+    assert _load(tmp_path, config)["stac"]["is_test_instance"] is False
+
+
+def test_source_folder_off_the_allowlist_is_refused_at_startup(tmp_path: Path) -> None:
+    """A typo stops the run before Chrome opens, not at the first listing."""
+    config = _config_with()
+    config["source_folder"] = "inbx"
+
+    with pytest.raises(SystemProblem, match="source_folder"):
+        _load(tmp_path, config)
+
+
+def test_retired_dry_run_key_is_refused(tmp_path: Path) -> None:
+    """dry_run no longer protects anything, so it may not sit there looking like it does."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["dry_run"] = True
+
+    with pytest.raises(SystemProblem, match="no longer used"):
+        _load(tmp_path, config)
+
+
+def _with_alerts(**alerts: object) -> dict:
+    """Return a copy of the valid config with the alerts section changed."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["alerts"].update(alerts)
+    return config
+
+
+def test_alerts_off_with_blank_addresses_loads(tmp_path: Path) -> None:
+    """Off means nothing is sent, so the addresses may wait."""
+    assert _load(tmp_path, VALID_CONFIG)["alerts"]["enabled"] is False
+
+
+def test_alerts_on_with_both_addresses_loads_stripped(tmp_path: Path) -> None:
+    """Stray spaces around a pasted address are removed, not sent to Graph."""
+    config = _load(
+        tmp_path, _with_alerts(enabled=True, send_from=" alerts@example.com ", send_to="person@example.com")
+    )
+
+    assert config["alerts"]["send_from"] == "alerts@example.com"
+
+
+@pytest.mark.parametrize("blank", ["send_from", "send_to"])
+def test_alerts_on_without_an_address_is_refused(tmp_path: Path, blank: str) -> None:
+    """An alert that could never be sent is found out at startup."""
+    config = _with_alerts(enabled=True, send_from="alerts@example.com", send_to="person@example.com")
+    config["alerts"][blank] = ""
+
+    with pytest.raises(SystemProblem, match=f"alerts.{blank}"):
+        _load(tmp_path, config)
+
+
+def test_missing_alerts_section_is_refused(tmp_path: Path) -> None:
+    """No defaults: an older config.yaml is told the section is needed."""
+    config = copy.deepcopy(VALID_CONFIG)
+    del config["alerts"]
+
+    with pytest.raises(SystemProblem, match="alerts"):
+        _load(tmp_path, config)
+
+
+def test_alerts_enabled_must_be_a_boolean(tmp_path: Path) -> None:
+    """A quoted "true" is a string, and is refused like the other switches."""
+    with pytest.raises(SystemProblem, match="alerts.enabled"):
+        _load(tmp_path, _with_alerts(enabled="true"))
 
 
 def test_section_that_is_not_a_mapping_is_refused(tmp_path: Path) -> None:
@@ -269,6 +372,7 @@ def _client(responses: list[FakeResponse]) -> tuple[GraphClient, FakeSession]:
     client = GraphClient.__new__(GraphClient)
     client._session = session
     client._allowed_mailboxes = frozenset({MAILBOX})
+    client._alert_sender = ALERT_SENDER
     client._get_token = lambda: "placeholder-token"
     return client, session
 
@@ -361,7 +465,10 @@ def test_write_to_mailbox_off_the_allowlist_is_refused() -> None:
     assert session.calls == []
 
 
-# list_messages with keep
+# list_messages
+
+
+BASE = f"https://graph.microsoft.com/v1.0/users/{MAILBOX}"
 
 
 def _message(message_id: str, tagged: bool = False) -> dict:
@@ -389,7 +496,7 @@ def test_passed_over_messages_do_not_count_toward_the_limit() -> None:
         _page([_message("u2"), _message("u3")], more=True),
     ])
 
-    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2, keep=_untagged)
+    listed = client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=2, keep=_untagged)
 
     assert [message["id"] for message in listed] == ["u1", "u2"]
     assert len(session.calls) == 2
@@ -399,7 +506,7 @@ def test_paging_stops_once_enough_are_kept() -> None:
     """The next page is not fetched when the first already has enough."""
     client, session = _client([_page([_message("u1"), _message("u2"), _message("u3")], more=True)])
 
-    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2, keep=_untagged)
+    listed = client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=2, keep=_untagged)
 
     assert [message["id"] for message in listed] == ["u1", "u2"]
     assert len(session.calls) == 1
@@ -409,7 +516,7 @@ def test_without_keep_every_message_counts() -> None:
     """skip_tagged off: tagged mail is listed and counted exactly as before."""
     client, _ = _client([_page([_message("t1", True), _message("u1"), _message("u2")], more=True)])
 
-    listed = client.list_messages(MAILBOX, days_back=2, max_messages=2)
+    listed = client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=2)
 
     assert [message["id"] for message in listed] == ["t1", "u1"]
 
@@ -418,16 +525,45 @@ def test_keep_asks_for_full_pages() -> None:
     """--limit 3 with keep must not page through handled mail three at a time."""
     client, session = _client([_page([], more=False), _page([], more=False)])
 
-    client.list_messages(MAILBOX, days_back=2, max_messages=3, keep=_untagged)
-    client.list_messages(MAILBOX, days_back=2, max_messages=3)
+    client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=3, keep=_untagged)
+    client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=3)
 
     assert [params["$top"] for params in session.params] == [100, 3]
 
 
+def test_listing_reads_the_folder_it_is_given() -> None:
+    """The folder comes from the caller, not a name written into the client."""
+    client, session = _client([_page([], more=False)])
+
+    client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=1)
+
+    assert session.calls[0][1] == f"{BASE}/mailFolders/deleteditems/messages"
+
+
+def test_inbox_listing_is_allowed() -> None:
+    """Live reads the Inbox. config.source_folder picks it; the allowlist lets it through."""
+    client, session = _client([_page([], more=False)])
+
+    client.list_messages(MAILBOX, days_back=2, folder="inbox", max_messages=1)
+
+    assert session.calls[0][1] == f"{BASE}/mailFolders/inbox/messages"
+
+
+def test_read_allowlist_is_exactly_inbox_and_deleted_items() -> None:
+    """Pinned, so widening where DALYN reads is a deliberate edit to this test too."""
+    assert ALLOWED_FOLDERS == frozenset({"deleteditems", "inbox"})
+
+
+def test_listing_a_folder_off_the_allowlist_is_refused_before_any_request() -> None:
+    """Naming a folder is not permission to read it. ALLOWED_FOLDERS still decides."""
+    client, session = _client([])
+
+    with pytest.raises(SystemProblem, match="folder not on allowlist"):
+        client.list_messages(MAILBOX, days_back=2, folder="archive", max_messages=1)
+    assert session.calls == []
+
+
 # Moving
-
-
-BASE = f"https://graph.microsoft.com/v1.0/users/{MAILBOX}"
 
 
 def test_deleted_items_is_looked_up_by_its_well_known_name() -> None:
@@ -511,6 +647,50 @@ def test_immutable_ids_join_other_preferences() -> None:
     """The listing's plain-text body preference is kept, not overwritten."""
     client, session = _client([_page([], more=False)])
 
-    client.list_messages(MAILBOX, days_back=2, max_messages=1)
+    client.list_messages(MAILBOX, days_back=2, folder="deleteditems", max_messages=1)
 
     assert session.headers[0]["Prefer"] == 'outlook.body-content-type="text", IdType="ImmutableId"'
+
+
+# Alert mail
+
+
+def test_send_mail_posts_one_plain_text_message_from_the_alert_sender() -> None:
+    """One sendMail call, plain text, not kept in Sent Items."""
+    client, session = _client([FakeResponse(202)])
+
+    client.send_mail("Alerts@Example.com", "person@example.com", "DALYN stopped", "See the log.")
+
+    method, url, payload = session.calls[0]
+    assert (method, url) == ("POST", f"https://graph.microsoft.com/v1.0/users/{ALERT_SENDER}/sendMail")
+    assert payload["saveToSentItems"] is False
+    assert payload["message"]["body"] == {"contentType": "Text", "content": "See the log."}
+    assert payload["message"]["toRecipients"] == [{"emailAddress": {"address": "person@example.com"}}]
+
+
+def test_send_mail_from_any_other_address_is_refused_before_any_request() -> None:
+    """Not even a monitored mailbox may send: only the one alert sender."""
+    client, session = _client([])
+
+    with pytest.raises(SystemProblem, match="alert sender"):
+        client.send_mail(MAILBOX, "person@example.com", "subject", "body")
+    assert session.calls == []
+
+
+def test_send_mail_with_no_alert_sender_is_refused() -> None:
+    """Alerts not configured: nothing can be sent at all."""
+    client, session = _client([])
+    client._alert_sender = None
+
+    with pytest.raises(SystemProblem, match="alert sender"):
+        client.send_mail(ALERT_SENDER, "person@example.com", "subject", "body")
+    assert session.calls == []
+
+
+def test_alert_sender_cannot_be_read() -> None:
+    """Sending from a mailbox does not put it on the list DALYN may read."""
+    client, session = _client([])
+
+    with pytest.raises(SystemProblem, match="allowlist"):
+        client.list_messages(ALERT_SENDER, days_back=2, folder="inbox", max_messages=1)
+    assert session.calls == []
