@@ -143,6 +143,16 @@ stac:
   # and relies on the page being left tidy.
   fresh_browser: true
 
+  # When one email's attachments go under different Type/Subtype pairs, STAC
+  # needs one upload box per pair. true keeps later boxes on the case page
+  # the last Save left, skipping the case search (and, with fresh_browser,
+  # the restart between boxes; Chrome still restarts after the email). Only
+  # with Save on, and only when the page checks out: same case, no file
+  # listed, Subtype cleared, saved notification gone. Otherwise it searches
+  # as usual. false, or the line left out, searches for every box. Live:
+  # false until it has run cleanly on dev.
+  reuse_case_page: false
+
   # Seconds to pause after each step, so a person can watch what the browser
   # is doing. 0 for normal running. 1 makes a pass roughly ten seconds per
   # document slower, which is fine while testing and not fine in production.

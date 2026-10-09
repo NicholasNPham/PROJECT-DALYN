@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from stac import document_label, name_in_text
+import pytest
+
+from stac import document_label, name_in_text, names_match
 
 # Made-up names only.
 STAC = "DOE, JOHN A (ALERT)"
@@ -62,3 +64,54 @@ def test_document_label_falls_back_without_leaking() -> None:
     """A file not named by main.py is never logged by name."""
     assert document_label(Path("Doe John Notice.pdf")) == "a document"
     assert document_label(Path("abc_1_Doe.pdf")) == "a document"
+
+
+# names_match: the Polk caption check. Made-up names only.
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "JOHN A DOE",
+        "JOHN A. DOE",
+        "JOHN ALLEN DOE",
+        "JOHN DOE",
+        "DOE, JOHN A",
+        "JOHN A DOE MOTION",
+        "JOHN A DOE IN AND FOR",
+        "JOHN A DOE ORDER ON MOTION TO CONTINUE",
+    ],
+)
+def test_whole_middle_name_in_stac_matches_initial_or_none_in_caption(caption: str) -> None:
+    """STAC's full middle name is optional: initial, whole or absent, extra caption words or not."""
+    assert names_match("DOE, JOHN ALLEN", caption)
+
+
+def test_stac_flags_are_ignored() -> None:
+    """Alert flags in brackets are not part of the name."""
+    assert names_match("DOE, JOHN ALLEN (ALERT)", "JOHN A DOE MOTION")
+
+
+def test_ocr_slip_in_surname_still_matches_with_extra_words() -> None:
+    """The 82% leeway still applies to the required words."""
+    assert names_match("THOMPSON, JOHN ALLEN", "JOHN A THORNPSON MOTION")
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "JANE A DOE MOTION",
+        "JOHN A SMITH MOTION",
+        "JOHN A DOW",
+    ],
+    ids=["different first name", "different surname", "surname too far off"],
+)
+def test_different_person_still_fails(caption: str) -> None:
+    """Loosening the middle name does not loosen the surname or first name."""
+    assert not names_match("DOE, JOHN ALLEN", caption)
+
+
+def test_multi_word_surname_needs_every_part_in_the_caption() -> None:
+    """Every word of the surname is required, as in name_in_text."""
+    assert names_match("DE LA ROSA, MARIA ELENA", "MARIA E DE LA ROSA MOTION")
+    assert not names_match("DE LA ROSA, MARIA ELENA", "MARIA E ROSA MOTION")

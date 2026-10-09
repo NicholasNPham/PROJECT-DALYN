@@ -223,7 +223,7 @@ def _validate(config: dict, path: Path) -> None:
     if not url.lower().startswith("https://"):
         raise SystemProblem(f"Config 'stac.url' must be https, got {url!r}.")
 
-    for key in ("is_test_instance", "upload_enabled", "save_enabled", "fresh_browser"):
+    for key in ("is_test_instance", "upload_enabled", "save_enabled", "fresh_browser", "reuse_case_page"):
         if key in stac and not isinstance(stac[key], bool):
             raise SystemProblem(f"Config key 'stac.{key}' must be true or false.")
 

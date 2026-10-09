@@ -23,6 +23,7 @@ import re
 import time
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -455,6 +456,8 @@ class StacSession:
         # offers UCN the first time. Reset whenever a new browser opens.
         self._criteria_is_ucn = False
         self._pair = ""
+        # Set by find_case. Empty means no case is open in this browser.
+        self._case_url = ""
 
     def __enter__(self) -> "StacSession":
         self.open()
@@ -652,6 +655,9 @@ class StacSession:
             self._check_defendant(ucn, stac_name, document_text)
         self._open_images_tab(ucn)
         self._pause("images tab open")
+        # What ready_for_next_box compares against, so a later box of the
+        # same email only skips the search while the page is still this case.
+        self._case_url = self.driver.current_url
         return stac_name
 
     def _open_case_search(self) -> None:
@@ -851,6 +857,61 @@ class StacSession:
             self.driver.execute_script("arguments[0].click();", tab)
         except TimeoutException as error:
             raise SystemProblem(f"Could not open the Images tab for {ucn}.") from error
+
+    def ready_for_next_box(self) -> bool:
+        """True if the page a Save left behind can take the next upload box.
+
+        After Save, STAC stays on the case with the dropzone usable again, the
+        Type and Subtype cleared and no file listed (checked by hand in test
+        STAC, 9 Oct 2026). That is what lets a later box of the same email skip
+        the case search. Each of those is checked here rather than trusted,
+        because a person clicking and Selenium driving can leave the page
+        differently. Any doubt is False, and the caller restarts and searches
+        as before. add_documents then fails loudly if the dropzone is missing,
+        and confirms the Subtype before Save as always.
+
+        Never raises: a check that cannot run counts as not ready.
+        """
+        try:
+            if not self._case_url:
+                logger.info("Not reusing the case page: no case was opened in this browser")
+                return False
+            # STAC changes the address's path after a Save while showing the
+            # same case with the dropzone ready (9 Oct 2026 run, and by hand),
+            # so an identical address is not required. DALYN clicks nothing
+            # between that Save and this check, so the page can only be the
+            # case it saved to. Leaving STAC's site entirely is still refused.
+            before, after = urlsplit(self._case_url), urlsplit(self.driver.current_url)
+            if before.netloc != after.netloc:
+                logger.info("Not reusing the case page: the browser has left STAC")
+                return False
+            changed = [part for part in ("path", "query", "fragment") if getattr(before, part) != getattr(after, part)]
+            if changed:
+                # Which parts, never the address itself.
+                logger.info("The page address changed after Save (%s); checking the page itself", ", ".join(changed))
+
+            # A leftover message would satisfy the next upload's wait, which
+            # counts these, before the new file had finished.
+            if self.driver.find_elements(By.XPATH, UPLOAD_SUCCESS_XPATH):
+                logger.info("Not reusing the case page: the last upload is still listed")
+                return False
+
+            subtype = self.driver.execute_script(
+                f"var d = $({SUBTYPE_INPUT_SELECTOR!r}).data('kendoDropDownList');"
+                "return d ? d.value() : null;"
+            )
+            if subtype:
+                logger.info("Not reusing the case page: the Subtype still shows %s", subtype)
+                return False
+
+            if any(note.is_displayed() for note in self.driver.find_elements(By.XPATH, SAVED_NOTIFICATION_XPATH)):
+                logger.info("Not reusing the case page: the saved notification is still showing")
+                return False
+        except WebDriverException as error:
+            logger.info("Not reusing the case page: could not check it (%s)", type(error).__name__)
+            return False
+
+        return True
 
     # ------------------------------------------------------------- add image
 
@@ -1602,6 +1663,17 @@ def names_match(stac_name: str, document_name: str) -> bool:
     if stac_tokens.issubset(document_tokens) or document_tokens.issubset(stac_tokens):
         return True
 
+    # STAC's surname and first name must both be in the caption; the middle
+    # name is optional. STAC writes the whole middle name where filings often
+    # print only the initial, and the caption DALYN extracts can run on into
+    # a word of the title. Together those failed a correct Polk filing on
+    # 9 Oct 2026: with one extra caption word, the old rule made STAC's
+    # whole middle name required, and the initial never matches it.
+    required = set(_required_name_words(stac_name))
+    if len(required) >= MIN_NAME_TOKENS and _every_word_has_a_near_match(required, document_tokens):
+        logger.info("Names matched on surname and first name")
+        return True
+
     # Whichever name has fewer words has to be fully accounted for in the
     # other. Going the other way would let a one-word name match anything.
     fewer, more = sorted((stac_tokens, document_tokens), key=len)
@@ -1773,6 +1845,10 @@ class StacRunner:
         # and it is the behaviour that does not depend on STAC leaving the
         # page tidy. Turn it off for speed once a pass is reliably clean.
         self.fresh_browser = bool(config["stac"].get("fresh_browser", True))
+        # Off when absent, which is the behavior before it existed: every
+        # upload box searches the case. On, a later box of the same email
+        # stays on the case page a Save left, when ready_for_next_box agrees.
+        self.reuse_case_page = bool(config["stac"].get("reuse_case_page", False))
         self.session: StacSession | None = None
 
     def __enter__(self) -> "StacRunner":
@@ -1855,31 +1931,48 @@ class StacRunner:
         entered: list = []
 
         for attempt in range(1, self.max_attempts + 1):
+            # True once a box of this email has been saved and the page left
+            # on the case. Starts False on every attempt, so a retry, which
+            # follows a fresh browser, always begins with a search.
+            on_case = False
             try:
                 # Only the groups not already in STAC. On a retry the earlier
                 # ones are already filed, and redoing them would duplicate.
-                for key, paths in groups:
-                    if key in [done_key for done_key, _ in entered]:
-                        continue
-
-                    # The case is re-opened per group, not once per email. A
-                    # STAC upload box holds one Type/Subtype, so a motion and
-                    # an order need separate trips, and each trip ends with
-                    # the page somewhere else: after a Save, or after the
-                    # reload that discards an unsaved upload. Starting from
-                    # the case search each time is the only state that is
-                    # reliably correct.
-                    self.session.find_case(ucn, document_text, subject, body)
+                remaining = [(key, paths) for key, paths in groups if key not in [done for done, _ in entered]]
+                for box, (key, paths) in enumerate(remaining, start=1):
+                    # A STAC upload box holds one Type/Subtype, so a motion
+                    # and an order need separate trips. Without reuse, each
+                    # trip starts from the case search, the one state that is
+                    # always correct. With reuse, a later box stays on the
+                    # case a Save left behind, once the page checks out.
+                    if on_case and self.session.ready_for_next_box():
+                        logger.info("%s: reusing the case page for box %s of %s", ucn, box, len(remaining))
+                    else:
+                        if on_case and self.fresh_browser:
+                            # The restart skipped after the last box, done now.
+                            # Searching from a case page a Save left behind
+                            # hits STAC's disabled search box, which is what
+                            # cost a retry on 9 Oct 2026.
+                            self._restart_session()
+                        self.session.find_case(ucn, document_text, subject, body)
 
                     document_type, subtype = key
                     self.session.add_documents(ucn, document_type, subtype, paths, before_save)
                     entered.append((key, paths))
 
-                    if self.fresh_browser:
+                    # Only a pressed Save leaves the case page behind. With
+                    # Save off the upload is discarded by a reload instead.
+                    on_case = self.reuse_case_page and self.session.save_enabled
+                    more_boxes = box < len(remaining)
+
+                    if self.fresh_browser and not (on_case and more_boxes):
                         # Close Chrome and sign in again, so the next upload
                         # box, and the next email, start from a clean page
-                        # rather than whatever STAC left behind.
+                        # rather than whatever STAC left behind. Kept for the
+                        # email's last box even when reusing, so every email
+                        # still starts fresh.
                         self._restart_session()
+                        on_case = False
 
                 return entered
 

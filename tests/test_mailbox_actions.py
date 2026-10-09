@@ -272,6 +272,20 @@ def test_missing_alerts_section_is_refused(tmp_path: Path) -> None:
         _load(tmp_path, config)
 
 
+def test_quoted_reuse_case_page_is_refused(tmp_path: Path) -> None:
+    """A quoted "false" is a non-empty string, which Python would read as on."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["stac"]["reuse_case_page"] = "false"
+
+    with pytest.raises(SystemProblem, match="reuse_case_page"):
+        _load(tmp_path, config)
+
+
+def test_reuse_case_page_may_be_left_out(tmp_path: Path) -> None:
+    """Optional: absent means off, today's behavior, so the live config needs no edit."""
+    assert "reuse_case_page" not in _load(tmp_path, VALID_CONFIG)["stac"]
+
+
 def test_alerts_enabled_must_be_a_boolean(tmp_path: Path) -> None:
     """A quoted "true" is a string, and is refused like the other switches."""
     with pytest.raises(SystemProblem, match="alerts.enabled"):

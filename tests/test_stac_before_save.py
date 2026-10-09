@@ -97,6 +97,7 @@ def _runner(gone_at: int) -> StacRunner:
     runner = StacRunner.__new__(StacRunner)
     runner.max_attempts = 2
     runner.fresh_browser = False
+    runner.reuse_case_page = False
     runner.session = FakeSession(gone_at)
     runner._restart_session = lambda: None
     return runner
