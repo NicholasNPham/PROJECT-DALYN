@@ -93,7 +93,10 @@ def _send(config: dict, subject: str, body: str, send: Sender | None) -> bool:
     try:
         (send or _graph_sender(config))(subject, body)
     except Exception as error:  # noqa: BLE001 - any failure to send is only logged
-        logger.error("Could not send the %r alert email: %s", subject, type(error).__name__)
+        # The message is Graph's answer to the sendMail call (status and its
+        # reason), not the run's error, so it carries no case number. Without
+        # it a refused send could not be told from a missing permission.
+        logger.error("Could not send the %r alert email: %s: %s", subject, type(error).__name__, error)
         return False
 
     logger.info("Sent the %r alert email", subject)
