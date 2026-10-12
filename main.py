@@ -25,8 +25,9 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, time as clock_time, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -159,6 +160,69 @@ MAX_CONSECUTIVE_STAC_FAILURES = 5
 # is actually down.
 MAX_CONSECUTIVE_FAILURES = 3
 MIN_WATCH_SECONDS = 10
+
+# --watch outside working hours: the longest single sleep. Waking every ten
+# minutes to check the clock again means a clock change, or the PC waking
+# from sleep, is noticed within that long instead of after a stale sleep.
+MAX_IDLE_SLEEP = 600
+
+
+class WorkingHours(NamedTuple):
+    """When --watch may start a pass: weekdays, from start up to end.
+
+    A pass that starts before end is left to finish, even if it runs past.
+    """
+
+    start: clock_time
+    end: clock_time
+
+
+def _parse_hours(text: str) -> WorkingHours:
+    """Read --hours, such as 07:00-17:00.
+
+    Raises:
+        argparse.ArgumentTypeError: If it is not two HH:MM times, start first.
+    """
+    try:
+        start_text, end_text = text.split("-")
+        start = datetime.strptime(start_text.strip(), "%H:%M").time()
+        end = datetime.strptime(end_text.strip(), "%H:%M").time()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected HH:MM-HH:MM, such as 07:00-17:00, not {text!r}")
+    if start >= end:
+        raise argparse.ArgumentTypeError(f"the start must be before the end, not {text!r}")
+    return WorkingHours(start, end)
+
+
+def _next_working_time(now: datetime, hours: WorkingHours) -> datetime | None:
+    """Return when the next pass may start, or None if one may start now.
+
+    Weekends are off. Before start waits for start the same day; from end
+    on waits for start the next day, and a Saturday or Sunday that lands
+    on moves on to Monday.
+    """
+    if now.weekday() < 5 and hours.start <= now.time() < hours.end:
+        return None
+    day = now.date() if now.weekday() < 5 and now.time() < hours.start else now.date() + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return datetime.combine(day, hours.start)
+
+
+def _wait_for_working_hours(hours: WorkingHours | None) -> None:
+    """Sleep until a pass may start. Returns at once when it already may.
+
+    Logs once when the wait begins, not every time it wakes to check.
+    """
+    if hours is None:
+        return
+    announced = False
+    while (resume := _next_working_time(datetime.now(), hours)) is not None:
+        if not announced:
+            logger.info("Outside working hours, next pass at %s", resume.strftime("%a %H:%M"))
+            announced = True
+        remaining = (resume - datetime.now()).total_seconds()
+        time.sleep(min(MAX_IDLE_SLEEP, max(1.0, remaining)))
 
 
 def _is_pdf(data: bytes) -> bool:
@@ -934,8 +998,12 @@ def run_pass(config: dict, limit: int | None = None) -> int:
     return EXIT_OK
 
 
-def _watch(config: dict, limit: int | None, interval: int) -> int:
+def _watch(config: dict, limit: int | None, interval: int, hours: WorkingHours | None = None) -> int:
     """Run a pass every `interval` seconds until Ctrl+C.
+
+    With hours, a pass starts only inside them and the watch sleeps outside
+    them. No pass means no alert email either, so nights and weekends are
+    quiet.
 
     Unless mailbox_actions.skip_tagged is on, an email still in the source
     folder is read again every pass. With it on, an email DALYN has tagged is
@@ -951,9 +1019,12 @@ def _watch(config: dict, limit: int | None, interval: int) -> int:
     failures = 0
     pass_number = 0
     logger.info("Watching: one pass every %s seconds. Ctrl+C to stop.", interval)
+    if hours is not None:
+        logger.info("Working hours: weekdays %s-%s", hours.start.strftime("%H:%M"), hours.end.strftime("%H:%M"))
 
     try:
         while True:
+            _wait_for_working_hours(hours)
             pass_number += 1
             logger.info("===== Pass %s =====", pass_number)
             try:
@@ -994,11 +1065,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SECONDS",
         help="Repeat a pass every SECONDS (default 120) until Ctrl+C.",
     )
+    parser.add_argument(
+        "--hours",
+        type=_parse_hours,
+        metavar="HH:MM-HH:MM",
+        help="With --watch: start passes only on weekdays between these times, such as 07:00-17:00.",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.watch is not None and args.watch < MIN_WATCH_SECONDS:
         parser.error(f"--watch must be at least {MIN_WATCH_SECONDS} seconds")
+    if args.hours is not None and args.watch is None:
+        parser.error("--hours needs --watch")
 
     # Logging is not set up yet, because the log folder comes from config.
     try:
@@ -1024,7 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_pass(config, limit=args.limit)
             report_success(config)
             return result
-        return _watch(config, args.limit, args.watch)
+        return _watch(config, args.limit, args.watch, args.hours)
     except GraphAuthError as error:
         logger.error("Graph sign-in failed. Check the client secret has not expired. %s", error)
         # Tried anyway, though it goes through the same sign-in and will

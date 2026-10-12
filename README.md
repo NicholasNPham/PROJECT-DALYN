@@ -87,16 +87,19 @@ and files to the live system, and its `config.yaml` is never edited for
 testing. Changes are tested on dev, pushed, then pulled on live with
 `git pull`.
 
-**Running live.** Windows Task Scheduler runs `python main.py` from the
-project folder every 15 minutes, with "Do not start a new instance" so runs
-never overlap, and "Run only when user is logged on" because the browser is
-a visible window. Each run takes up to `max_messages_per_mailbox` emails
-from each enabled mailbox, oldest first.
+**Running live.** The live machine runs
+`python main.py --watch 180 --hours 07:00-17:00` from the project folder:
+a pass every 180 seconds, starting passes only on weekdays from 07:00 to
+17:00, and sleeping outside those hours. The window must stay open and the
+machine awake, because the browser is a visible window. Each pass takes up
+to `max_messages_per_mailbox` emails from each enabled mailbox, oldest
+first.
 
 **Usage**
 ```
 python main.py --limit 5     # one pass, at most 5 emails from each mailbox
 python main.py --watch 120   # a pass every 120 seconds until Ctrl+C
+python main.py --watch 180 --hours 07:00-17:00   # same, weekdays 07:00-17:00 only
 python check_types.py        # check the config and the rules sheet against the system's type list
 python -m pytest             # tests
 ```
