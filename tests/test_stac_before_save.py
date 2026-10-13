@@ -24,6 +24,7 @@ def _session(calls: list[str]) -> StacSession:
     session._select_type_subtype = lambda document_type, subtype: calls.append("type")
     session._save = lambda ucn, subtype, names: calls.append("save")
     session._discard_pending_upload = lambda: calls.append("discard")
+    session._wait_out_spinner = lambda after: None
     return session
 
 

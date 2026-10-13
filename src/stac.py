@@ -27,7 +27,10 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
     NoAlertPresentException,
+    NoSuchElementException,
+    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
@@ -349,6 +352,11 @@ PREVIEW_WAIT_SECONDS = 5
 
 # Kendo marks the chosen grid row with this class.
 KENDO_SELECTED_CLASS = "k-selected"
+
+# Kendo's loading spinner. On 2026-10-13 one sat over Save for over a
+# minute, so it is waited out after each upload step, to find which step
+# leaves it stuck.
+SPINNER_CSS = ".k-loading-image"
 
 # Save
 SAVE_BUTTON_ID = "SaveImage"
@@ -956,11 +964,14 @@ class StacSession:
             return
 
         self._open_dropzone()
+        self._wait_out_spinner("opening the dropzone")
         self._pause("dropzone open")
         self._upload(paths)
+        self._wait_out_spinner("the upload")
         self._pause(f"uploaded {names}")
         self._pair = f"{document_type}/{subtype}"
         self._select_type_subtype(document_type, subtype)
+        self._wait_out_spinner(f"picking {self._pair}")
 
         if not self.save_enabled:
             self._reach_save_without_pressing(ucn, subtype, names)
@@ -973,6 +984,47 @@ class StacSession:
             raise MessageGone("a person moved the email before Save")
 
         self._save(ucn, subtype, names)
+
+    def _wait_out_spinner(self, after: str) -> None:
+        """Wait for STAC's loading spinner to clear before the next step.
+
+        A step taken while STAC is still loading the last one may be what
+        leaves the spinner stuck, so this is a wait, not a fixed sleep. Each
+        time the spinner was up, how long it took is logged with the step,
+        so a few runs show which step it follows.
+
+        Args:
+            after: The step just done, for the log, e.g. "the upload".
+
+        Raises:
+            SystemProblem: If the spinner is still up after upload_timeout.
+                Nothing has been saved yet, so StacRunner's retry in a fresh
+                browser is safe, and it is what cleared the stuck spinner on
+                2026-10-13.
+        """
+        if not self._spinner_showing():
+            return
+        started = time.monotonic()
+        try:
+            WebDriverWait(self.driver, self.upload_timeout, poll_frequency=0.25).until(
+                lambda d: not self._spinner_showing()
+            )
+        except TimeoutException as error:
+            raise SystemProblem(
+                f"STAC's loading spinner was still up {self.upload_timeout}s after {after}."
+            ) from error
+        logger.info("STAC's loading spinner cleared %.1fs after %s", time.monotonic() - started, after)
+
+    def _spinner_showing(self) -> bool:
+        """True while any Kendo loading spinner on the page is shown.
+
+        Kendo leaves hidden spinners in the page, so only shown ones count.
+        One replaced mid-check counts as showing, to be looked at again.
+        """
+        try:
+            return any(spinner.is_displayed() for spinner in self.driver.find_elements(By.CSS_SELECTOR, SPINNER_CSS))
+        except StaleElementReferenceException:
+            return True
 
     def _reach_save_without_pressing(self, ucn: str, subtype: str, names: str) -> None:
         """Go as far as the Save button, prove it is ready, and leave it alone.
@@ -1561,10 +1613,13 @@ class StacSession:
                 f"The Subtype field never showed {subtype} before Save."
             ) from error
 
+        # A covered click never reaches the button, so nothing is saved and
+        # trying again is safe.
+        press = PressWhenUncovered(SAVE_BUTTON_ID)
         try:
-            upload_wait.until(EC.element_to_be_clickable((By.ID, SAVE_BUTTON_ID))).click()
+            upload_wait.until(press)
         except TimeoutException as error:
-            raise SystemProblem("Could not press Save.") from error
+            raise SystemProblem(f"Could not press Save: {press.blocker}.") from error
 
         # Past this line STAC may already have the document.
         try:
@@ -1793,6 +1848,68 @@ def _xpath_literal(value: str) -> str:
     parts = value.split("'")
     joined = ', "\'", '.join(f"'{part}'" for part in parts)
     return f"concat({joined})"
+
+
+class PressWhenUncovered:
+    """A WebDriverWait condition that clicks the element once nothing covers it.
+
+    Selenium's "clickable" means shown and enabled, not uncovered. After an
+    upload STAC lays its k-loading-image spinner over the page for a moment,
+    and a click then lands on the spinner and raises. That stopped dev runs
+    at Save on 2026-10-12 and 2026-10-13.
+
+    On 2026-10-13 Save then stayed blocked for over a minute on one email,
+    twice, and "Could not press Save." alone could not say why. So each try
+    records what stood in the way, in `blocker`, for the error to name. Only
+    a tag and its class or id, never page text, which can carry party names.
+    """
+
+    def __init__(self, element_id: str) -> None:
+        """Remember the element to click, for example SAVE_BUTTON_ID."""
+        self.element_id = element_id
+        self.blocker = "nothing tried yet"
+
+    def __call__(self, driver: object) -> bool:
+        """Try the click once. True once it went through, False to keep waiting."""
+        try:
+            element = driver.find_element(By.ID, self.element_id)
+            if not element.is_displayed():
+                self.blocker = "the button is hidden"
+                return False
+            if not element.is_enabled():
+                self.blocker = "the button is disabled"
+                return False
+            element.click()
+        except NoSuchElementException:
+            self.blocker = "the button is not on the page"
+            return False
+        except StaleElementReferenceException:
+            self.blocker = "the page was redrawing"
+            return False
+        except ElementClickInterceptedException as error:
+            self.blocker = f"covered by {describe_intercepting_element(error.msg or '')}"
+            return False
+        return True
+
+
+def describe_intercepting_element(message: str) -> str:
+    """Name the element Chrome says took the click, as tag.class or tag#id.
+
+    Chrome's message ends "Other element would receive the click: <div
+    class="k-loading-image"></div>". Only the tag and its class or id are
+    kept, so no text from the page reaches the log.
+    """
+    match = re.search(r"would receive the click: <(\w+)([^>]*)>", message)
+    if not match:
+        return "another element"
+    tag, attributes = match.groups()
+    found = re.search(r'\bclass="([^"]*)"', attributes)
+    if found and found.group(1).strip():
+        return f"{tag}.{'.'.join(found.group(1).split())}"
+    found = re.search(r'\bid="([^"]*)"', attributes)
+    if found and found.group(1):
+        return f"{tag}#{found.group(1)}"
+    return tag
 
 
 def document_label(path: Path) -> str:
