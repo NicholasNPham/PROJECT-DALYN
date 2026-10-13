@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import graph_client
 from config_loader import load_config
 from exceptions import MessageGone, SystemProblem
 from graph_client import ALLOWED_FOLDERS, GraphClient
@@ -195,10 +196,11 @@ def test_reading_the_inbox_against_test_stac_untagged_is_allowed(tmp_path: Path)
     assert _load(tmp_path, config)["source_folder"] == "inbox"
 
 
-def test_uploading_deleted_items_into_live_stac_is_refused(tmp_path: Path) -> None:
-    """Deleted Items is finished mail; uploading it to live would file it twice."""
+@pytest.mark.parametrize("folder", ["deleteditems", "deleteditems/DALYN Test In"])
+def test_uploading_deleted_items_into_live_stac_is_refused(tmp_path: Path, folder: str) -> None:
+    """Deleted Items, and any folder inside it, is finished mail; uploading it to live would file it twice."""
     config = _live_like(save=False, move=False)
-    config["source_folder"] = "deleteditems"
+    config["source_folder"] = folder
 
     with pytest.raises(SystemProblem, match="filed twice"):
         _load(tmp_path, config)
@@ -387,6 +389,7 @@ def _client(responses: list[FakeResponse]) -> tuple[GraphClient, FakeSession]:
     client._allowed_mailboxes = frozenset({MAILBOX})
     client._alert_sender = ALERT_SENDER
     client._get_token = lambda: "placeholder-token"
+    client._folder_names = {}
     return client, session
 
 
@@ -564,7 +567,7 @@ def test_inbox_listing_is_allowed() -> None:
 
 def test_read_allowlist_is_exactly_inbox_and_deleted_items() -> None:
     """Pinned, so widening where DALYN reads is a deliberate edit to this test too."""
-    assert ALLOWED_FOLDERS == frozenset({"deleteditems", "inbox"})
+    assert ALLOWED_FOLDERS == frozenset({"deleteditems", "inbox", "deleteditems/dalyn test in"})
 
 
 def test_listing_a_folder_off_the_allowlist_is_refused_before_any_request() -> None:
@@ -574,6 +577,59 @@ def test_listing_a_folder_off_the_allowlist_is_refused_before_any_request() -> N
     with pytest.raises(SystemProblem, match="folder not on allowlist"):
         client.list_messages(MAILBOX, days_back=2, folder="archive", max_messages=1)
     assert session.calls == []
+
+
+TEST_IN = "deleteditems/dalyn test in"
+
+
+def test_child_folder_on_the_read_list_is_read_by_its_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A folder a person made has no well-known name, so its id is looked up first."""
+    monkeypatch.setattr(graph_client, "ALLOWED_FOLDERS", ALLOWED_FOLDERS | {TEST_IN})
+    client, session = _client([FakeResponse(200, {"value": [{"id": "test-in-id"}]}), _page([], more=False)])
+
+    client.list_messages(MAILBOX, days_back=2, folder="deleteditems/DALYN Test In", max_messages=1)
+
+    assert [call[1] for call in session.calls] == [
+        f"{BASE}/mailFolders/deleteditems/childFolders",
+        f"{BASE}/mailFolders/test-in-id/messages",
+    ]
+    assert session.params[0]["$filter"] == "displayName eq 'DALYN Test In'"
+
+
+def test_child_folder_id_is_its_own_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_folder_id needs no second request once the child is found."""
+    monkeypatch.setattr(graph_client, "ALLOWED_FOLDERS", ALLOWED_FOLDERS | {TEST_IN})
+    client, session = _client([FakeResponse(200, {"value": [{"id": "test-in-id"}]})])
+
+    assert client.get_folder_id(MAILBOX, "deleteditems/DALYN Test In") == "test-in-id"
+    assert len(session.calls) == 1
+
+
+def test_child_folder_off_the_read_list_is_refused_before_any_request() -> None:
+    """Being inside Deleted Items is not permission. The full name must be listed."""
+    client, session = _client([])
+
+    with pytest.raises(SystemProblem, match="folder not on allowlist"):
+        client.list_messages(MAILBOX, days_back=2, folder="deleteditems/Other Folder", max_messages=1)
+    assert session.calls == []
+
+
+def test_done_folder_id_cannot_be_read_from() -> None:
+    """An id found as a move target is still only a move target."""
+    client, _ = _client([FakeResponse(200, {"value": [{"id": "completed-id"}]})])
+    client.get_move_target_id(MAILBOX, "deleteditems/DALYN Completed")
+
+    with pytest.raises(SystemProblem, match="folder not on allowlist"):
+        client._mailbox_url(MAILBOX, "mailFolders/completed-id/messages")
+
+
+def test_missing_child_folder_to_read_stops_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DALYN never creates the folder it reads, either."""
+    monkeypatch.setattr(graph_client, "ALLOWED_FOLDERS", ALLOWED_FOLDERS | {TEST_IN})
+    client, _ = _client([FakeResponse(200, {"value": []})])
+
+    with pytest.raises(SystemProblem, match="Create it in Outlook"):
+        client.list_messages(MAILBOX, days_back=2, folder="deleteditems/DALYN Test In", max_messages=1)
 
 
 # Moving

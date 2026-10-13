@@ -306,8 +306,9 @@ def _refuse_test_live_mix(source: str, stac: dict, actions: dict) -> None:
     # Deleted Items is mail staff already finished, the testing stand-in for
     # the Inbox. Uploading it into live STAC would file real documents a
     # second time. Reading it against live with upload off (a check that
-    # cases exist) stays allowed.
-    if source == "deleteditems" and not is_test and stac.get("upload_enabled"):
+    # cases exist) stays allowed. A folder inside Deleted Items, such as a
+    # test folder, holds the same finished mail.
+    if source.split("/")[0] == "deleteditems" and not is_test and stac.get("upload_enabled"):
         raise SystemProblem(
             "Config reads Deleted Items and uploads to live STAC. That mail is "
             "already finished and would be filed twice. Set source_folder to inbox, "

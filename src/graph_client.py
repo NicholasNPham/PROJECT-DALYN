@@ -13,7 +13,7 @@ from logger import get_logger
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 
-ALLOWED_FOLDERS = frozenset({"deleteditems", "inbox"})
+ALLOWED_FOLDERS = frozenset({"deleteditems", "inbox", "deleteditems/dalyn test in"})
 
 # Folders DALYN may move mail INTO, compared ignoring case. Kept apart from
 # ALLOWED_FOLDERS on purpose: that list is where DALYN reads from, and adding
@@ -26,7 +26,7 @@ ALLOWED_FOLDERS = frozenset({"deleteditems", "inbox"})
 # filed mail into the child as if it were Deleted Items. A listing of
 # Deleted Items does not include its child folders, so moved mail drops out
 # of what DALYN reads, exactly as it will when it leaves the Inbox.
-MOVE_TARGETS = frozenset({"deleteditems", "deleteditems/dalyn completed"})
+MOVE_TARGETS = frozenset({"deleteditems", "deleteditems/dalyn completed", "deleteditems/dalyn test done"})
 
 # Asks Graph for message IDs that survive a move. Staff work the same Inbox
 # as DALYN, and a default ID changes when someone drags the email to another
@@ -96,6 +96,10 @@ class GraphClient:
             mailbox.strip().lower() for mailbox in allowed_mailboxes
         )
         self._alert_sender = alert_sender.strip().lower() if alert_sender else None
+        # Graph knows a folder a person made only by its id. Each id DALYN
+        # looks up is remembered with the allowlisted name it was found
+        # under, so _mailbox_url can check the id against the same lists.
+        self._folder_names: dict[str, str] = {}
 
         logger.debug("MSAL client built for tenant %s", tenant_id)
 
@@ -148,7 +152,8 @@ class GraphClient:
             raise SystemProblem(f"Refusing request: mailbox not on allowlist: {mailbox}")
 
         if path.startswith("mailFolders/"):
-            folder = path.split("/")[1].lower()
+            segment = path.split("/")[1]
+            folder = self._folder_names.get(segment, segment.lower())
             if folder not in folders:
                 raise SystemProblem(
                     f"Refusing request: folder not on allowlist: {folder}"
@@ -312,7 +317,8 @@ class GraphClient:
 
         direction = "desc" if newest_first else "asc"
 
-        url = self._mailbox_url(mailbox, f"mailFolders/{folder}/messages")
+        segment = self._folder_segment(mailbox, folder, ALLOWED_FOLDERS)
+        url = self._mailbox_url(mailbox, f"mailFolders/{segment}/messages", folders=ALLOWED_FOLDERS)
         params = {
             "$filter": f"receivedDateTime ge {cutoff}",
             "$orderby": f"receivedDateTime {direction}",
@@ -380,17 +386,72 @@ class GraphClient:
         return messages
 
     def get_folder_id(self, mailbox: str, folder: str) -> str:
-        """Return Graph's ID for a well-known folder such as deleteditems or inbox.
+        """Return Graph's ID for the folder DALYN reads, such as inbox.
 
         Fetched once per pass and compared against each message's
         parentFolderId, to tell whether the message is still where DALYN
         found it.
 
         Raises:
-            SystemProblem: If the folder is not on the allowlist, or Graph fails.
+            SystemProblem: If the folder is not on the allowlist, a child
+                folder does not exist, or Graph fails.
         """
-        url = self._mailbox_url(mailbox, f"mailFolders/{folder}")
+        return self._folder_id(mailbox, folder, ALLOWED_FOLDERS)
+
+    def _folder_id(self, mailbox: str, name: str, folders: frozenset[str]) -> str:
+        """Return Graph's ID for a folder on `folders`, by well-known name or as parent/child.
+
+        Raises:
+            SystemProblem: If the name is not on `folders`, a child folder
+                does not exist, or Graph fails.
+        """
+        segment = self._folder_segment(mailbox, name, folders)
+        if "/" in name:
+            return segment
+        url = self._mailbox_url(mailbox, f"mailFolders/{segment}", folders=folders)
         return self._request("GET", url, params={"$select": "id"}).json()["id"]
+
+    def _folder_segment(self, mailbox: str, name: str, folders: frozenset[str]) -> str:
+        """Return what follows mailFolders/ in a URL for a folder named in config.
+
+        A well-known name such as "deleteditems" is used as it is.
+        "parent/child" is a folder a person made, found by its display name
+        inside the parent, since Graph has no well-known name for it. The
+        id found is remembered under the name, so later URLs built from it
+        pass the same allowlist. DALYN never creates a folder: a missing one
+        is a setup step a person skipped, and the run stops to say so.
+
+        Args:
+            mailbox: SMTP address of the mailbox.
+            name: From config, e.g. "inbox" or "deleteditems/DALYN Completed".
+            folders: The list the name must be on, ALLOWED_FOLDERS to read
+                or MOVE_TARGETS to move into.
+
+        Raises:
+            SystemProblem: If the name is not on `folders`, the child folder
+                does not exist, or Graph fails.
+        """
+        key = name.strip().lower()
+        if key not in folders:
+            raise SystemProblem(f"Refusing request: folder not on allowlist: {key}")
+        if "/" not in key:
+            return key
+
+        parent, child = name.strip().split("/", 1)
+        url = self._mailbox_url(mailbox, f"mailFolders/{parent.strip().lower()}/childFolders", folders=folders)
+        # Graph string literals escape a quote by doubling it.
+        literal = child.strip().replace("'", "''")
+        found = self._request(
+            "GET", url, params={"$filter": f"displayName eq '{literal}'", "$select": "id"}
+        ).json().get("value", [])
+        if not found:
+            raise SystemProblem(
+                f"{mailbox} has no folder {child.strip()!r} inside {parent}. "
+                "Create it in Outlook first; DALYN does not create folders."
+            )
+        folder_id = found[0]["id"]
+        self._folder_names[folder_id] = key
+        return folder_id
 
     def get_parent_folder_id(self, mailbox: str, message_id: str) -> str:
         """Return the ID of the folder a message is in right now.
@@ -521,27 +582,9 @@ class GraphClient:
             SystemProblem: If the name is not on MOVE_TARGETS, the folder
                 does not exist, or Graph fails.
         """
-        key = name.strip().lower()
-        if key not in MOVE_TARGETS:
+        if name.strip().lower() not in MOVE_TARGETS:
             raise SystemProblem(f"Refusing request: {name!r} is not a folder DALYN may move into")
-
-        if "/" not in key:
-            url = self._mailbox_url(mailbox, f"mailFolders/{key}", folders=MOVE_TARGETS)
-            return self._request("GET", url, params={"$select": "id"}).json()["id"]
-
-        parent, child = name.strip().split("/", 1)
-        url = self._mailbox_url(mailbox, f"mailFolders/{parent.lower()}/childFolders", folders=MOVE_TARGETS)
-        # Graph string literals escape a quote by doubling it.
-        literal = child.strip().replace("'", "''")
-        found = self._request(
-            "GET", url, params={"$filter": f"displayName eq '{literal}'", "$select": "id"}
-        ).json().get("value", [])
-        if not found:
-            raise SystemProblem(
-                f"{mailbox} has no folder {child.strip()!r} inside {parent}. "
-                "Create it in Outlook first; DALYN does not create folders."
-            )
-        return found[0]["id"]
+        return self._folder_id(mailbox, name, MOVE_TARGETS)
 
     def move_message(self, mailbox: str, message_id: str, destination_id: str) -> None:
         """Move one message into a folder from get_move_target_id.
