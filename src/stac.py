@@ -358,6 +358,13 @@ KENDO_SELECTED_CLASS = "k-selected"
 # leaves it stuck.
 SPINNER_CSS = ".k-loading-image"
 
+# Seconds to let the spinner show up after clicking an image tile. The click
+# starts a preview load whose spinner appears a moment later, so checking at
+# once can call the page clear while it is still loading. On 2026-10-13 live,
+# every upload that got stuck was on a reused case page, which always has a
+# tile to click, and the check right after the click had seen no spinner.
+SPINNER_APPEAR_SECONDS = 2
+
 # Save
 SAVE_BUTTON_ID = "SaveImage"
 SAVED_NOTIFICATION_XPATH = "//div[contains(@class,'c-notification-success')]"
@@ -973,7 +980,8 @@ class StacSession:
             )
             return
 
-        self._open_dropzone()
+        if self._open_dropzone():
+            self._let_spinner_appear()
         self._wait_out_spinner("opening the dropzone")
         self._pause("dropzone open")
         self._upload(paths)
@@ -1024,6 +1032,20 @@ class StacSession:
                 f"STAC's loading spinner was still up {self.upload_timeout}s after {after}."
             ) from error
         logger.info("STAC's loading spinner cleared %.1fs after %s", time.monotonic() - started, after)
+
+    def _let_spinner_appear(self) -> None:
+        """Give a spinner that has not shown yet a moment to show.
+
+        Returns as soon as one shows, so _wait_out_spinner can wait it out,
+        or after SPINNER_APPEAR_SECONDS if none does. Either way is fine:
+        this only stops a spinner that is about to appear from being missed.
+        """
+        try:
+            WebDriverWait(self.driver, SPINNER_APPEAR_SECONDS, poll_frequency=0.1).until(
+                lambda d: self._spinner_showing()
+            )
+        except TimeoutException:
+            pass
 
     def _spinner_showing(self) -> bool:
         """True while any Kendo loading spinner on the page is shown.
@@ -1091,8 +1113,11 @@ class StacSession:
                 f"Could not clear the unsaved upload before the next document: {error}"
             ) from error
 
-    def _open_dropzone(self) -> None:
+    def _open_dropzone(self) -> bool:
         """Get the Images tab into the state where files can be dropped.
+
+        Returns True if an image tile was clicked, since that starts a
+        preview load the caller must let finish before uploading.
 
         Three steps, and only the middle one is required.
 
@@ -1108,10 +1133,13 @@ class StacSession:
         Raises:
             SystemProblem: If the dropzone itself never appears.
         """
+        clicked = False
         tiles = self.driver.find_elements(By.CSS_SELECTOR, IMAGE_TILE_UNSELECTED_CSS)
         if tiles:
             try:
                 self.driver.execute_script("arguments[0].click();", tiles[0])
+                clicked = True
+                logger.info("Clicked an existing image to open the dropzone")
             except WebDriverException as error:
                 logger.debug("Could not click an image tile: %s", error)
         else:
@@ -1123,6 +1151,7 @@ class StacSession:
             raise SystemProblem("The upload dropzone never appeared.") from error
 
         self._wait_for_preview()
+        return clicked
 
     def _wait_for_preview(self) -> None:
         """Let an existing document's preview settle, if there is one.

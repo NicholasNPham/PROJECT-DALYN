@@ -25,6 +25,7 @@ def _session(calls: list[str]) -> StacSession:
     session._save = lambda ucn, subtype, names: calls.append("save")
     session._discard_pending_upload = lambda: calls.append("discard")
     session._wait_out_spinner = lambda after: None
+    session._let_spinner_appear = lambda: calls.append("appear")
     return session
 
 
@@ -38,6 +39,17 @@ def test_save_goes_ahead_when_the_email_is_still_there() -> None:
     _session(calls).add_documents("UCN", "COURT", "ORDERS", PATHS, lambda: calls.append("check") or True)
 
     assert calls == ["dropzone", "upload", "type", "check", "save"]
+
+
+def test_clicked_tile_gets_the_spinner_window_before_the_upload() -> None:
+    """A clicked tile starts a preview load, so its late spinner is given time to show."""
+    calls: list[str] = []
+    session = _session(calls)
+    session._open_dropzone = lambda: calls.append("dropzone") or True
+
+    session.add_documents("UCN", "COURT", "ORDERS", PATHS)
+
+    assert calls == ["dropzone", "appear", "upload", "type", "save"]
 
 
 def test_moved_email_is_not_saved_and_the_upload_is_thrown_away() -> None:

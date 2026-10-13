@@ -11,6 +11,7 @@ from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.webdriver.support.ui import WebDriverWait
 
 from exceptions import SystemProblem
+import stac
 from stac import SAVE_BUTTON_ID, PressWhenUncovered, StacSession, describe_intercepting_element
 
 
@@ -172,3 +173,50 @@ def test_stuck_spinner_names_the_step() -> None:
     """Still up at the timeout: a SystemProblem, so the runner retries in a fresh browser."""
     with pytest.raises(SystemProblem, match="still up 0.1s after picking COURT/ORDERS"):
         _spinner_session(FakeSpinner(shown=10**6), timeout=0.1)._wait_out_spinner("picking COURT/ORDERS")
+
+
+class LateSpinner:
+    """A spinner hidden for its first `hidden` checks, then up for `shown` more."""
+
+    def __init__(self, hidden: int, shown: int) -> None:
+        """Remember when it shows and for how long."""
+        self.hidden = hidden
+        self.shown = shown
+        self.checks = 0
+
+    def is_displayed(self) -> bool:
+        """Like a preview load: not up yet, then up, then gone."""
+        self.checks += 1
+        return self.hidden < self.checks <= self.hidden + self.shown
+
+
+def test_late_spinner_is_missed_by_a_check_alone() -> None:
+    """The 13 Oct failure: checked before it showed, so the upload went in under it."""
+    spinner = LateSpinner(hidden=2, shown=3)
+
+    _spinner_session(spinner)._wait_out_spinner("opening the dropzone")
+
+    assert spinner.checks == 1
+
+
+def test_late_spinner_is_caught_and_waited_out(caplog: pytest.LogCaptureFixture) -> None:
+    """With the appear window first, the spinner is seen and waited out before the upload."""
+    spinner = LateSpinner(hidden=2, shown=3)
+    session = _spinner_session(spinner)
+
+    with caplog.at_level(logging.INFO, logger="dalyn.stac"):
+        session._let_spinner_appear()
+        session._wait_out_spinner("opening the dropzone")
+
+    assert spinner.checks > 5
+    assert "after opening the dropzone" in caplog.text
+
+
+def test_no_spinner_in_the_window_goes_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing shows: the window ends quietly and the upload goes ahead."""
+    monkeypatch.setattr(stac, "SPINNER_APPEAR_SECONDS", 0.2)
+    spinner = FakeSpinner(shown=0)
+
+    _spinner_session(spinner)._let_spinner_appear()
+
+    assert spinner.checks > 1
