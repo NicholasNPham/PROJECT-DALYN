@@ -41,6 +41,8 @@ REVIEW_TAGS = {
 STAC_FAILURE_TAGS = {
     StacResult.UNKNOWN: ReviewTag.MAY_BE_SAVED,
     StacResult.FAILED: ReviewTag.STAC_FAILED,
+    # Red, and should_move leaves it in the Inbox: nothing was filed.
+    StacResult.WAITING: ReviewTag.WAITING,
 }
 
 # Queued, Processing and Saving: DALYN still has the email. By name, not by

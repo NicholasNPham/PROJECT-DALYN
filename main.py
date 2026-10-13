@@ -52,7 +52,8 @@ from tagging import (  # noqa: E402
     tag_email,
     was_interrupted,
 )
-from stac import PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
+from recheck import is_waiting, latest_slot, received_local, should_wait  # noqa: E402
+from stac import CaseNotFound, PartiallyEntered, SaveMayHaveHappened, StacRunner  # noqa: E402
 
 logger = get_logger("main")
 
@@ -617,9 +618,14 @@ def _enter_in_stac(
     work_dir: Path,
     email_number: int,
     message: dict,
+    max_business_days: int,
     before_save: Callable[[], bool] | None = None,
 ) -> bool:
     """Put one email's documents into STAC and record the result on each row.
+
+    When STAC has no case with the number, the email is WAITING if the case
+    may just not be built yet (recheck.should_wait), and FAILED if it has
+    waited max_business_days or its year says the number is a typo.
 
     Only called for an email already decided UPLOAD, so every enterable
     attachment goes or none does.
@@ -669,6 +675,15 @@ def _enter_in_stac(
         _mark_stac(enterable, StacResult.FAILED, str(error))
         logger.error("Email %s: %s", email_number, error)
         return False
+    except CaseNotFound as error:
+        if should_wait(ucn_value, received_local(message), datetime.now(), max_business_days):
+            _mark_stac(enterable, StacResult.WAITING, str(error))
+            logger.info("Email %s: not filed yet, waiting for STAC to have the case. %s", email_number, error)
+        else:
+            _mark_stac(enterable, StacResult.FAILED, f"{error} Not waiting: too old, or the year is not a new case.")
+            logger.info("Email %s: not filed, %s Not waiting any longer.", email_number, error)
+        # Like any document problem, not STAC being down.
+        return True
     except DocumentProblem as error:
         _mark_stac(enterable, StacResult.FAILED, str(error))
         logger.info("Email %s: not filed, %s", email_number, error)
@@ -697,7 +712,8 @@ def _mark_stac(rows: list[dict], result: str, reason: str) -> None:
         row["stac_result"] = result
         row["stac_reason"] = reason
 
-    if result in (StacResult.FAILED, StacResult.UNKNOWN):
+    # WAITING too: nothing was filed, so it must not count as an upload.
+    if result in (StacResult.FAILED, StacResult.UNKNOWN, StacResult.WAITING):
         for row in rows:
             row["email_decision"] = EmailDecision.MANUAL_REVIEW
             row["email_reason"] = reason
@@ -716,12 +732,14 @@ def _write_csv(rows: list[dict], path: Path) -> None:
 def _log_mailbox_table(
     mailboxes: list[str], emails: list[dict], listed: Counter, moved: Counter
 ) -> None:
-    """Log one line per mailbox: listed, upload, review, moved, gone.
+    """Log one line per mailbox: listed, upload, review, moved, gone, waiting.
 
     Counts emails, not attachments. Upload means the email went (or, before
-    Save is on, would go) into STAC whole; review means a person has it. A
-    mailbox that listed nothing still gets its row of zeros, which is the
-    point: an empty folder and a broken one look different here.
+    Save is on, would go) into STAC whole; review means a person has it;
+    waiting means STAC had no case yet and DALYN will search again, so it is
+    not counted under review. A mailbox that listed nothing still gets its
+    row of zeros, which is the point: an empty folder and a broken one look
+    different here.
 
     Args:
         mailboxes: Enabled mailboxes, in config order.
@@ -730,20 +748,22 @@ def _log_mailbox_table(
         moved: Emails moved to the done folder per mailbox this pass.
     """
     decisions = Counter((row["mailbox"], row["email_decision"]) for row in emails)
-    logger.info("By mailbox (emails):             listed upload review  moved   gone")
+    waiting = Counter(row["mailbox"] for row in emails if row.get("stac_result") == StacResult.WAITING)
+    logger.info("By mailbox (emails):             listed upload review  moved   gone waiting")
     for address in mailboxes:
         logger.info(
-            "  %-30s %6s %6s %6s %6s %6s",
+            "  %-30s %6s %6s %6s %6s %6s %7s",
             address,
             listed.get(address, 0),
             decisions.get((address, EmailDecision.UPLOAD), 0),
-            decisions.get((address, EmailDecision.MANUAL_REVIEW), 0),
+            decisions.get((address, EmailDecision.MANUAL_REVIEW), 0) - waiting.get(address, 0),
             moved.get(address, 0),
             decisions.get((address, EmailDecision.GONE), 0),
+            waiting.get(address, 0),
         )
 
 
-def run_pass(config: dict, limit: int | None = None) -> int:
+def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> int:
     """One pass over the source folder of every enabled mailbox, in file order.
 
     Mailboxes are read one at a time to completion, each up to its own batch
@@ -754,6 +774,11 @@ def run_pass(config: dict, limit: int | None = None) -> int:
         config: From load_config.
         limit: Tighten max_messages_per_mailbox for this pass. Per mailbox
             too, so --limit 1 is one email from each enabled mailbox.
+        recheck: Also take every email tagged Waiting for STAC, after the
+            batch and outside it, and search STAC for its case again. Not
+            capped: these are few, since each leaves after
+            recheck.max_business_days, and a cap would leave some unsearched
+            until the next recheck time.
 
     Raises:
         SystemProblem: Rules sheet, Graph or Tesseract failure, or five
@@ -837,6 +862,24 @@ def run_pass(config: dict, limit: int | None = None) -> int:
                     # interrupted emails through for the check below.
                     keep=needs_handling if actions["skip_tagged"] else None,
                 )
+                if recheck:
+                    # A second listing rather than widening keep, so the
+                    # batch size still applies to new mail alone. With
+                    # skip_tagged off the batch may already hold some.
+                    listed_ids = {message["id"] for message in messages}
+                    waiting = [
+                        message
+                        for message in client.list_messages(
+                            mailbox,
+                            days_back=config["days_back"],
+                            folder=config["source_folder"],
+                            newest_first=config["newest_first"],
+                            keep=is_waiting,
+                        )
+                        if message["id"] not in listed_ids
+                    ]
+                    logger.info("%s: %s email(s) waiting for STAC, searching again", mailbox, len(waiting))
+                    messages += waiting
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
                 listed_by_mailbox[mailbox] = len(messages)
@@ -898,7 +941,15 @@ def run_pass(config: dict, limit: int | None = None) -> int:
                     summary = _decide_email(email_rows, email_number)
 
                     if email_rows[0]["email_decision"] == EmailDecision.UPLOAD:
-                        if _enter_in_stac(runner, email_rows, work_dir, email_number, message, before_save):
+                        if _enter_in_stac(
+                            runner,
+                            email_rows,
+                            work_dir,
+                            email_number,
+                            message,
+                            config["recheck"]["max_business_days"],
+                            before_save,
+                        ):
                             stac_failures = 0
                         else:
                             stac_failures += 1
@@ -998,6 +1049,21 @@ def run_pass(config: dict, limit: int | None = None) -> int:
     return EXIT_OK
 
 
+def _recheck_due(slot: datetime | None, last_recheck: datetime | None, rechecked: bool) -> bool:
+    """True when this watch pass should also search STAC again for waiting emails.
+
+    Args:
+        slot: recheck.latest_slot for now.
+        last_recheck: The slot the last successful recheck ran in.
+        rechecked: Whether any recheck has succeeded since the watch started.
+    """
+    if not rechecked:
+        return True
+    # Before the first time of the day the slot is None, which must not
+    # count as new, or every morning would recheck at its first pass.
+    return slot is not None and slot != last_recheck
+
+
 def _watch(config: dict, limit: int | None, interval: int, hours: WorkingHours | None = None) -> int:
     """Run a pass every `interval` seconds until Ctrl+C.
 
@@ -1015,20 +1081,35 @@ def _watch(config: dict, limit: int | None, interval: int, hours: WorkingHours |
     A failed credential stops the watch at once. Any other SystemProblem is
     logged and retried next pass, up to MAX_CONSECUTIVE_FAILURES in a row.
     The alert email follows each pass the same way it follows a single run.
+
+    Waiting for STAC emails are searched again on the first pass, since a
+    restart may have missed a recheck time, and then on the first pass at
+    or after each of recheck.times. A recheck pass that fails is tried
+    again on the next pass rather than skipped to the next time.
     """
     failures = 0
     pass_number = 0
+    times = config["recheck"]["times"]
+    # The recheck time last done, with its date. None means none done yet.
+    last_recheck: datetime | None = None
+    rechecked = False
     logger.info("Watching: one pass every %s seconds. Ctrl+C to stop.", interval)
     if hours is not None:
         logger.info("Working hours: weekdays %s-%s", hours.start.strftime("%H:%M"), hours.end.strftime("%H:%M"))
+    logger.info("Rechecking waiting emails at %s", ", ".join(slot.strftime("%H:%M") for slot in times))
 
     try:
         while True:
             _wait_for_working_hours(hours)
             pass_number += 1
-            logger.info("===== Pass %s =====", pass_number)
+            slot = latest_slot(datetime.now(), times)
+            recheck = _recheck_due(slot, last_recheck, rechecked)
+            logger.info("===== Pass %s%s =====", pass_number, " (recheck)" if recheck else "")
             try:
-                run_pass(config, limit=limit)
+                run_pass(config, limit=limit, recheck=recheck)
+                if recheck:
+                    rechecked = True
+                    last_recheck = slot
                 failures = 0
                 report_success(config)
             except GraphAuthError:
@@ -1071,6 +1152,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="HH:MM-HH:MM",
         help="With --watch: start passes only on weekdays between these times, such as 07:00-17:00.",
     )
+    parser.add_argument(
+        "--recheck",
+        action="store_true",
+        help="One pass that also searches STAC again for every email tagged Waiting for STAC.",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
@@ -1078,6 +1164,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--watch must be at least {MIN_WATCH_SECONDS} seconds")
     if args.hours is not None and args.watch is None:
         parser.error("--hours needs --watch")
+    if args.recheck and args.watch is not None:
+        parser.error("--recheck is for one pass; --watch rechecks at recheck.times by itself")
 
     # Logging is not set up yet, because the log folder comes from config.
     try:
@@ -1100,7 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ocr.configure_tesseract(config["paths"].get("tesseract"))
         if args.watch is None:
-            result = run_pass(config, limit=args.limit)
+            result = run_pass(config, limit=args.limit, recheck=args.recheck)
             report_success(config)
             return result
         return _watch(config, args.limit, args.watch, args.hours)

@@ -78,6 +78,13 @@ class ReviewTag:
     STAC_FAILED = "DALYN: STAC could not file"
     MAY_BE_SAVED = "DALYN: Check STAC first"
 
+    # STAC had no case with this number, and the email is young enough that
+    # the case may simply not be built yet. Red and left in the Inbox, so
+    # staff leave it alone; DALYN searches again at the recheck times, and
+    # past the age limit it becomes STAC_FAILED for a person (Nick, 12 Oct
+    # 2026). Not in_progress(): ordinary passes must skip it.
+    WAITING = "DALYN: Waiting for STAC"
+
     @classmethod
     def all(cls) -> list[str]:
         """Return every tag, for creating them in a mailbox's master list."""
@@ -107,7 +114,7 @@ class ReviewTag:
         Green unless listed otherwise, so a tag added later without a color
         decision shows as one a person must look at, not as done.
         """
-        red = cls.in_progress() | {cls.FILED, cls.NO_RULE}
+        red = cls.in_progress() | {cls.FILED, cls.NO_RULE, cls.WAITING}
         return {tag: cls.RED_COLOR if tag in red else cls.GREEN_COLOR for tag in cls.all()}
 
     @classmethod
@@ -177,12 +184,16 @@ class StacResult:
 
     ENTERED and REHEARSED both mean everything worked. The difference is only
     whether stac.save_enabled was on.
+
+    WAITING means STAC had no case with this number and the email is held
+    to be searched again later. Nothing was entered.
     """
 
     ENTERED = "ENTERED"
     REACHED_SAVE = "REACHED_SAVE"
     REHEARSED = "REHEARSED"
     FAILED = "FAILED"
+    WAITING = "WAITING"
     UNKNOWN = "UNKNOWN"
     NOT_ATTEMPTED = ""
 

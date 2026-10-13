@@ -7,6 +7,7 @@ rest of DALYN reads config["graph"]["client_secret"] and config["stac"]
 from.
 """
 
+from datetime import datetime, time
 from pathlib import Path
 
 import yaml
@@ -29,6 +30,7 @@ REQUIRED_KEYS = (
     "stac",
     "mailbox_actions",
     "alerts",
+    "recheck",
     "paths",
 )
 REQUIRED_GRAPH_KEYS = ("tenant_id", "client_id")
@@ -66,6 +68,9 @@ MOVE_FOLDER_KEYS = ("done_folder",)
 # The email sent when a run stops. All three are required even while it is
 # off, so turning it on is one switch, like done_folder.
 ALERT_KEYS = ("enabled", "send_from", "send_to")
+# When an email whose case STAC could not find is searched again, and how
+# many business days it may wait before going to a person.
+RECHECK_KEYS = ("times", "max_business_days")
 
 # A url is treated as a test instance only if one of these appears in it.
 # Deliberately crude: the point is that a plain production url cannot be
@@ -254,6 +259,7 @@ def _validate(config: dict, path: Path) -> None:
     _validate_review_pair(stac)
     _validate_mailbox_actions(config["mailbox_actions"])
     _validate_alerts(config["alerts"])
+    _validate_recheck(config["recheck"])
 
     # Staff and DALYN share the Inbox. A filed email left there carries only
     # its red tag, and a person who clears that tag hands it back to DALYN,
@@ -386,6 +392,47 @@ def _validate_alerts(alerts: dict) -> None:
                 f"Config has alerts.enabled true but alerts.{key} is not an email "
                 "address. Fill it in, or turn alerts off."
             )
+
+
+def _validate_recheck(recheck: dict) -> None:
+    """Check the recheck times and age limit, and turn the times into time objects.
+
+    Raises:
+        SystemProblem: If the section is not a mapping, a key is missing, a
+            time is not a quoted HH:MM, the times are empty or out of order,
+            or max_business_days is not a positive integer.
+    """
+    if not isinstance(recheck, dict):
+        raise SystemProblem("Config key 'recheck' must be a mapping.")
+
+    missing = [key for key in RECHECK_KEYS if key not in recheck]
+    if missing:
+        raise SystemProblem(f"Config 'recheck' is missing: {', '.join(missing)}")
+
+    raw = recheck["times"]
+    if not isinstance(raw, list) or not raw:
+        raise SystemProblem("Config key 'recheck.times' must be a list of times, such as [\"09:00\", \"13:00\"].")
+
+    times: list[time] = []
+    for value in raw:
+        # Unquoted, YAML reads 13:00 as the number 780 (minutes, base 60),
+        # so a bare number here is that mistake, not a strange setting.
+        if not isinstance(value, str):
+            raise SystemProblem(
+                f"Config 'recheck.times' has {value!r}. Write each time in quotes, such as \"09:00\"."
+            )
+        try:
+            times.append(datetime.strptime(value.strip(), "%H:%M").time())
+        except ValueError as error:
+            raise SystemProblem(f"Config 'recheck.times' has {value!r}, which is not HH:MM.") from error
+
+    if times != sorted(set(times)):
+        raise SystemProblem("Config 'recheck.times' must be in order from earliest, with no repeats.")
+    recheck["times"] = times
+
+    days = recheck["max_business_days"]
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+        raise SystemProblem("Config key 'recheck.max_business_days' must be a positive integer.")
 
 
 def _refuse_stored_secrets(config: dict, path: Path) -> None:

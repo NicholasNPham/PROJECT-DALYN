@@ -5,6 +5,7 @@ records each request and answers from a script.
 """
 
 import copy
+from datetime import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ VALID_CONFIG = {
         "done_folder": "deleteditems/DALYN Completed",
     },
     "alerts": {"enabled": False, "send_from": "", "send_to": ""},
+    "recheck": {"times": ["09:00", "13:00", "17:00"], "max_business_days": 2},
     "paths": {"logs": "logs", "temp": "temp", "excel": "rules.xlsx", "stac_types": "types.xlsx"},
 }
 
@@ -69,6 +71,57 @@ def test_missing_section_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(SystemProblem, match="mailbox_actions"):
         _load(tmp_path, config)
+
+
+def test_recheck_times_load_as_times(tmp_path: Path) -> None:
+    """The quoted HH:MM strings come back as time objects, in order."""
+    config = _load(tmp_path, VALID_CONFIG)
+
+    assert config["recheck"]["times"] == [time(9), time(13), time(17)]
+    assert config["recheck"]["max_business_days"] == 2
+
+
+def test_missing_recheck_section_is_refused(tmp_path: Path) -> None:
+    """No defaults: a config.yaml from before rechecking stops at startup."""
+    config = copy.deepcopy(VALID_CONFIG)
+    del config["recheck"]
+
+    with pytest.raises(SystemProblem, match="recheck"):
+        _load(tmp_path, config)
+
+
+@pytest.mark.parametrize(
+    ("recheck", "message"),
+    [
+        ({"times": ["09:00"]}, "max_business_days"),
+        ({"times": [], "max_business_days": 2}, "list of times"),
+        ({"times": [780], "max_business_days": 2}, "in quotes"),
+        ({"times": ["9am"], "max_business_days": 2}, "HH:MM"),
+        ({"times": ["13:00", "09:00"], "max_business_days": 2}, "in order"),
+        ({"times": ["09:00", "09:00"], "max_business_days": 2}, "no repeats"),
+        ({"times": ["09:00"], "max_business_days": 0}, "positive integer"),
+        ({"times": ["09:00"], "max_business_days": True}, "positive integer"),
+    ],
+    ids=["no-days", "no-times", "unquoted", "not-hhmm", "out-of-order", "repeated", "zero-days", "bool-days"],
+)
+def test_bad_recheck_is_refused(tmp_path: Path, recheck: dict, message: str) -> None:
+    """Each mistake is named at startup, not found at 09:00."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["recheck"] = recheck
+
+    with pytest.raises(SystemProblem, match=message):
+        _load(tmp_path, config)
+
+
+def test_unquoted_yaml_time_is_caught(tmp_path: Path) -> None:
+    """Written without quotes, YAML turns 13:00 into 780, which must not pass."""
+    path = tmp_path / "config.yaml"
+    text = yaml.safe_dump(VALID_CONFIG)
+    assert "'13:00'" in text
+    path.write_text(text.replace("'13:00'", "13:00"), encoding="utf-8")
+
+    with pytest.raises(SystemProblem, match="in quotes"):
+        load_config(path, with_credentials=False)
 
 
 def test_missing_switch_is_refused(tmp_path: Path) -> None:
@@ -310,7 +363,7 @@ def test_every_tag_carries_the_prefix() -> None:
     """The prefix is how DALYN recognizes its own categories."""
     tags = ReviewTag.all()
 
-    assert len(tags) == 15
+    assert len(tags) == 16
     assert all(tag.startswith(ReviewTag.PREFIX) and tag != ReviewTag.PREFIX for tag in tags)
     assert len(set(tags)) == len(tags)
 
@@ -327,7 +380,10 @@ def test_colors_say_who_has_the_email() -> None:
         ReviewTag.SAVING,
         ReviewTag.FILED,
         ReviewTag.NO_RULE,
+        ReviewTag.WAITING,
     }
+    # Red, but not in progress: an ordinary pass must leave it alone.
+    assert ReviewTag.WAITING not in ReviewTag.in_progress()
     assert colors[ReviewTag.INTERRUPTED] == ReviewTag.GREEN_COLOR
     assert colors[ReviewTag.NO_UCN] == ReviewTag.GREEN_COLOR
 

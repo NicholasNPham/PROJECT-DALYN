@@ -424,6 +424,16 @@ class SaveMayHaveHappened(SystemProblem):
     """
 
 
+class CaseNotFound(DocumentProblem):
+    """STAC's search found no case with this number.
+
+    Kept apart from other document problems because it can fix itself: the
+    case may not be built in STAC yet. main.py holds such an email red and
+    searches again later, instead of sending it to a person at once. A
+    mistyped number looks the same, which is why the wait has a limit.
+    """
+
+
 class PartiallyEntered(DocumentProblem):
     """Some of an email's documents are in STAC and the rest are not.
 
@@ -780,7 +790,7 @@ class StacSession:
             raise SystemProblem(f"STAC's search results never loaded for {ucn}.") from error
 
         if self.driver.find_elements(By.CSS_SELECTOR, NO_RECORDS_CSS):
-            raise DocumentProblem(
+            raise CaseNotFound(
                 f"No case in STAC with case number {ucn}. Either the number was "
                 "read wrong or the case is not in this instance."
             )
@@ -2105,11 +2115,16 @@ class StacRunner:
                     ) from error
                 raise
 
-            except (DocumentProblem, SaveMayHaveHappened):
+            except (DocumentProblem, SaveMayHaveHappened) as error:
                 # Both are this document's problem, and neither improves by
                 # trying again. SaveMayHaveHappened especially: a retry is
                 # exactly what would file it twice.
                 self._leave_browser_clean()
+                # A later box failing after an earlier one was saved must say
+                # so. Raised bare, a CaseNotFound would be held and searched
+                # again later, and the saved box filed a second time.
+                if entered and isinstance(error, DocumentProblem) and not isinstance(error, PartiallyEntered):
+                    raise PartiallyEntered(f"{self._already_in(entered)} Then: {error}") from error
                 raise
 
             except SystemProblem as error:

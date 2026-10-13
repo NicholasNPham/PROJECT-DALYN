@@ -6,7 +6,7 @@ from collections import Counter
 import pytest
 
 from main import _log_mailbox_table
-from models import EmailDecision
+from models import EmailDecision, StacResult
 
 FIRST = "first@example.com"
 SECOND = "second@example.com"
@@ -39,8 +39,20 @@ def test_counts_each_mailbox_separately(caplog: pytest.LogCaptureFixture) -> Non
 
     table = _table(caplog, [FIRST, SECOND], emails, listed, moved)
 
-    assert table[FIRST] == ["3", "2", "1", "2", "0"]
-    assert table[SECOND] == ["1", "0", "0", "0", "1"]
+    assert table[FIRST] == ["3", "2", "1", "2", "0", "0"]
+    assert table[SECOND] == ["1", "0", "0", "0", "1", "0"]
+
+
+def test_waiting_is_its_own_column(caplog: pytest.LogCaptureFixture) -> None:
+    """A waiting email is not one a person has, so it is not under review."""
+    emails = [
+        {"mailbox": FIRST, "email_decision": EmailDecision.MANUAL_REVIEW, "stac_result": StacResult.WAITING},
+        _email(FIRST, EmailDecision.MANUAL_REVIEW),
+    ]
+
+    table = _table(caplog, [FIRST], emails, Counter({FIRST: 2}), Counter())
+
+    assert table[FIRST] == ["2", "0", "1", "0", "0", "1"]
 
 
 def test_empty_mailbox_still_gets_a_row(caplog: pytest.LogCaptureFixture) -> None:
@@ -49,7 +61,7 @@ def test_empty_mailbox_still_gets_a_row(caplog: pytest.LogCaptureFixture) -> Non
 
     table = _table(caplog, [FIRST, EMPTY], [_email(FIRST, EmailDecision.UPLOAD)], listed, Counter())
 
-    assert table[EMPTY] == ["0", "0", "0", "0", "0"]
+    assert table[EMPTY] == ["0", "0", "0", "0", "0", "0"]
 
 
 def test_rows_follow_config_order(caplog: pytest.LogCaptureFixture) -> None:

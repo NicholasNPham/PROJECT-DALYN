@@ -112,6 +112,7 @@ def test_manual_review_gets_one_tag_per_distinct_reason() -> None:
     [
         (StacResult.FAILED, ReviewTag.STAC_FAILED),
         (StacResult.UNKNOWN, ReviewTag.MAY_BE_SAVED),
+        (StacResult.WAITING, ReviewTag.WAITING),
     ],
 )
 def test_stac_failure_is_tagged(stac_result: str, tag: str) -> None:
@@ -290,6 +291,11 @@ def test_result_tags_are_skipped() -> None:
     assert not needs_handling({"categories": [ReviewTag.INTERRUPTED]})
 
 
+def test_waiting_email_is_skipped_by_an_ordinary_pass() -> None:
+    """Red like Queued, but only a recheck pass takes it again."""
+    assert not needs_handling({"categories": [ReviewTag.WAITING]})
+
+
 @pytest.mark.parametrize("tag", [ReviewTag.QUEUED, ReviewTag.PROCESSING, ReviewTag.SAVING])
 def test_in_progress_email_left_by_a_crash_comes_through(tag: str) -> None:
     """A run that stopped mid-batch must not strand its Queued, Processing or Saving emails."""
@@ -446,6 +452,7 @@ def test_filed_email_should_move() -> None:
         [_row(EmailDecision.MANUAL_REVIEW, Outcome.NO_UCN)],
         [_row(EmailDecision.MANUAL_REVIEW, Outcome.WOULD_ENTER, StacResult.UNKNOWN)],
         [_row(EmailDecision.MANUAL_REVIEW, Outcome.INTERRUPTED)],
+        [_row(EmailDecision.MANUAL_REVIEW, Outcome.WOULD_ENTER, StacResult.WAITING)],
         [_row(EmailDecision.GONE, Outcome.GONE)],
     ],
 )

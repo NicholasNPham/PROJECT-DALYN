@@ -83,6 +83,18 @@ alerts:
   send_from: ""
   send_to: ""
 
+# When STAC has no case for an email's case number, the case may not be built
+# yet. The email is tagged red "DALYN: Waiting for STAC", stays in the folder,
+# and is searched again at the first --watch pass at or after each of these
+# times. After max_business_days weekdays from when it arrived, it goes green
+# "DALYN: STAC could not file" for a person. A case number whose year is not
+# this year or last goes green at once, since older cases are already in STAC
+# and that is a typo. Times in quotes, earliest first. Live: 09:00, 13:00,
+# 17:00 and 2, with --hours ending after the last time, such as 07:00-17:30.
+recheck:
+  times: ["09:00", "13:00", "17:00"]
+  max_business_days: 2
+
 # Only mail received in the last N days is read. Live: 7, so mail from Friday
 # evening is still in reach on Monday, or after a long weekend.
 days_back: 2

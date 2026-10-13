@@ -25,6 +25,13 @@ sure about.
    filed email moves to Deleted Items. Green names what went wrong
    and the email stays in the Inbox for a person, who can fix the cause and
    clear the label to have DALYN try again.
+8. An email whose case is not in the case management system yet, often
+   because the case is still being built, is labeled red "Waiting for STAC"
+   and stays in the Inbox. DALYN searches for the case again at set times of
+   day and files the email once the case appears. After 2 business days it
+   goes green for a person. A case number from before last year goes green
+   at once, since an old case would already exist and the number is likely
+   mistyped.
 
 It runs in stages, each switched on deliberately: read only, upload without
 saving, then save.
@@ -41,7 +48,7 @@ saving, then save.
 | Case management web app | `selenium` |
 | Secrets | Windows Credential Manager via `keyring` |
 | Config | `PyYAML`, validated at startup with no defaults |
-| Tests | `pytest`, 256 tests, no network or live systems |
+| Tests | `pytest`, 313 tests, no network or live systems |
 
 Design choices worth knowing:
 - **All or nothing per email.** Either every attachment is filed or none are,
@@ -53,6 +60,11 @@ Design choices worth knowing:
   and the configured folder, and the test-instance flag must match the URL.
 - **No personal data in output.** Logs and the review CSV hold case numbers
   and outcomes only, never names, subjects or email bodies.
+- **Waits, not sleeps, in the browser.** The case management system shows a
+  loading spinner while it works, and acting before it clears can leave it
+  stuck over the Save button. DALYN waits for the spinner to clear after
+  each upload step instead of pausing a fixed time, and when Save cannot be
+  pressed the error says what was in the way.
 
 ## 4. Results
 
@@ -81,25 +93,37 @@ stopping before Save:
 The Graph app registration needs `Mail.ReadWrite` and `MailboxSettings.ReadWrite`,
 plus `Mail.Send` for alert emails.
 
-**Two machines.** A dev machine reads Deleted Items as a stand-in for the
-Inbox and files to the test system. A dedicated live machine reads the Inbox
+**Two machines.** A dev machine reads a test folder inside Deleted Items as a
+stand-in for the Inbox, moves filed mail into a second test folder, and files
+to the test system. Both folders are made by hand in Outlook and named in
+`config.yaml` as `deleteditems/<folder name>`; each must also be on the
+allowlist in `src/graph_client.py`. A dedicated live machine reads the Inbox
 and files to the live system, and its `config.yaml` is never edited for
 testing. Changes are tested on dev, pushed, then pulled on live with
 `git pull`.
 
 **Running live.** The live machine runs
-`python main.py --watch 180 --hours 07:00-17:00` from the project folder:
+`python main.py --watch 180 --hours 07:00-17:30` from the project folder:
 a pass every 180 seconds, starting passes only on weekdays from 07:00 to
-17:00, and sleeping outside those hours. The window must stay open and the
+17:30, and sleeping outside those hours. The window must stay open and the
 machine awake, because the browser is a visible window. Each pass takes up
 to `max_messages_per_mailbox` emails from each enabled mailbox, oldest
 first.
+
+**Rechecking waiting emails.** The first pass at or after each time in
+`recheck.times` (live: 09:00, 13:00, 17:00) also searches again for every
+email labeled "Waiting for STAC". The first pass after starting always does,
+in case a time was missed while DALYN was off. `--hours` must end after the
+last recheck time, which is why live stops at 17:30 rather than 17:00.
+`recheck.max_business_days` (live: 2) is how long an email waits before it
+goes green, counted in weekdays from when it arrived.
 
 **Usage**
 ```
 python main.py --limit 5     # one pass, at most 5 emails from each mailbox
 python main.py --watch 120   # a pass every 120 seconds until Ctrl+C
-python main.py --watch 180 --hours 07:00-17:00   # same, weekdays 07:00-17:00 only
+python main.py --watch 180 --hours 07:00-17:30   # same, weekdays 07:00-17:30 only
+python main.py --recheck     # one pass that also searches again for every waiting email
 python check_types.py        # check the config and the rules sheet against the system's type list
 python -m pytest             # tests
 ```
@@ -108,7 +132,7 @@ python -m pytest             # tests
 
 | Setting | Controls |
 |---|---|
-| `source_folder` | `inbox` live, `deleteditems` on dev; reading the Inbox with tagging on the test system, or uploading Deleted Items to live, is refused |
+| `source_folder` | `inbox` live, a test folder inside Deleted Items on dev; reading the Inbox with tagging on the test system, or uploading Deleted Items or any folder inside it to live, is refused |
 | `mailboxes[].enabled` | Which mailboxes are reachable at all |
 | `stac.is_test_instance` | Must match the URL, or DALYN refuses to start |
 | `stac.upload_enabled` | Upload, stopping before Save |
