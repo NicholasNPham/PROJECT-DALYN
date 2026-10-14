@@ -9,6 +9,7 @@ from datetime import time
 from pathlib import Path
 
 import pytest
+import requests
 import yaml
 
 import graph_client
@@ -422,7 +423,7 @@ class FakeResponse:
 class FakeSession:
     """Records every request and answers each one from a queue of responses."""
 
-    def __init__(self, responses: list[FakeResponse]) -> None:
+    def __init__(self, responses: list[FakeResponse | Exception]) -> None:
         """Queue the responses, in the order the calls will be made."""
         self.responses = list(responses)
         self.calls: list[tuple[str, str, dict | None]] = []
@@ -430,14 +431,21 @@ class FakeSession:
         self.headers: list[dict] = []
 
     def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
-        """Record the call and return the next scripted response."""
+        """Record the call and return the next scripted response, or raise it.
+
+        A queued exception stands for a connection that dropped before Graph
+        answered.
+        """
         self.calls.append((method, url, kwargs.get("json")))
         self.params.append(kwargs.get("params"))
         self.headers.append(kwargs.get("headers") or {})
-        return self.responses.pop(0)
+        answer = self.responses.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
 
-def _client(responses: list[FakeResponse]) -> tuple[GraphClient, FakeSession]:
+def _client(responses: list[FakeResponse | Exception]) -> tuple[GraphClient, FakeSession]:
     """Build a GraphClient without MSAL, so nothing signs in or touches the network."""
     session = FakeSession(responses)
     client = GraphClient.__new__(GraphClient)
@@ -819,3 +827,48 @@ def test_alert_sender_cannot_be_read() -> None:
     with pytest.raises(SystemProblem, match="allowlist"):
         client.list_messages(ALERT_SENDER, days_back=2, folder="inbox", max_messages=1)
     assert session.calls == []
+
+
+# Dropped connections
+
+
+RESET = requests.ConnectionError("Connection aborted: reset by the remote host")
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retries back off with time.sleep; the tests should not wait."""
+    monkeypatch.setattr(graph_client.time, "sleep", lambda seconds: None)
+
+
+def test_read_that_loses_its_connection_is_retried(no_sleep: None) -> None:
+    """The 14 Oct 2026 crash: one reset on the check before Save, then Graph was fine."""
+    client, session = _client([RESET, FakeResponse(200, {"parentFolderId": "folder-1"})])
+
+    assert client.get_parent_folder_id(MAILBOX, "message-1") == "folder-1"
+    assert len(session.calls) == 2
+
+
+def test_read_that_times_out_is_retried(no_sleep: None) -> None:
+    """A timeout is the same kind of failure: no answer came back."""
+    client, session = _client([requests.Timeout("read timed out"), FakeResponse(200, {"parentFolderId": "folder-1"})])
+
+    assert client.get_parent_folder_id(MAILBOX, "message-1") == "folder-1"
+
+
+def test_read_that_never_reconnects_stops_with_a_system_problem(no_sleep: None) -> None:
+    """Still down after every retry: a SystemProblem, which --watch survives, not a raw error."""
+    client, session = _client([RESET] * graph_client.MAX_RETRIES)
+
+    with pytest.raises(SystemProblem, match="still failing"):
+        client.get_parent_folder_id(MAILBOX, "message-1")
+    assert len(session.calls) == graph_client.MAX_RETRIES
+
+
+def test_write_that_loses_its_connection_is_not_repeated(no_sleep: None) -> None:
+    """It may have landed, so it is reported once and never sent again."""
+    client, session = _client([RESET])
+
+    with pytest.raises(SystemProblem, match="may or may not have gone through"):
+        client.set_categories(MAILBOX, "message-1", [ReviewTag.FILED])
+    assert len(session.calls) == 1

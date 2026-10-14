@@ -181,8 +181,9 @@ class GraphClient:
         Raises:
             GraphAuthError: On 401, meaning the credential is bad or revoked.
             MessageGone: On 404, only when gone_on_404 is set.
-            SystemProblem: On any other non-success status, or if retries run out.
-            requests.RequestException: On network failure, meaning try next pass.
+            SystemProblem: On any other non-success status, if retries run
+                out, or if a write loses its connection. A read that loses its
+                connection is retried like a 503.
         """
         extra_headers = dict(kwargs.pop("headers", {}))
         # Every call, so an ID read in one call is valid in the next. Graph
@@ -193,9 +194,33 @@ class GraphClient:
             headers = {"Authorization": f"Bearer {self._get_token()}"}
             headers.update(extra_headers)
 
-            response = self._session.request(
-                method, url, headers=headers, timeout=30, **kwargs
-            )
+            try:
+                response = self._session.request(
+                    method, url, headers=headers, timeout=30, **kwargs
+                )
+            except (requests.ConnectionError, requests.Timeout) as error:
+                # No answer at all, unlike a 429 or 503. On 14 Oct 2026 live a
+                # reset connection on the check before Save escaped as a raw
+                # error and stopped --watch. A read is safe to repeat. A write
+                # may have landed before the line dropped, so like a gateway
+                # error on a write it is not repeated: SystemProblem lets the
+                # email retry in a fresh browser, or the pass end and --watch
+                # try again.
+                if method.upper() != "GET":
+                    raise SystemProblem(
+                        f"Graph {method} lost its connection ({type(error).__name__}) "
+                        "and may or may not have gone through."
+                    ) from error
+                wait = min(2**attempt, MAX_BACKOFF_SECONDS)
+                logger.warning(
+                    "Graph connection failed (%s), waiting %ss (attempt %s of %s)",
+                    type(error).__name__,
+                    wait,
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
 
             if response.ok:
                 return response
