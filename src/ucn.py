@@ -46,6 +46,14 @@ UCN_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}[A-Z]{2}\d{6}[A-Z]\d{3}[A-Z]{2}
 HIGHLANDS_HARDEE_PATTERN = re.compile(
     r"(?<!\d)((?:25|28)\d{4}(CF|MM|CT|TT|CJ)\d{6}(CF|MM|CT|TT|JL)AXMX)"
 )
+# Older Polk numbers end in two digits and four letters where today's end
+# in a letter, three digits and two letters: 53 2009 CF 000000 01XX XX
+# rather than 53 2026 CF 000000 A000 XX. A live email in Oct 2026 carried
+# one and went to a person as "No case number". Tried only when no current
+# form is in the text, and the number is searched exactly as written, so
+# nothing is converted or guessed. An old case STAC does not have still
+# goes straight to a person under the year rule.
+OLD_POLK_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}[A-Z]{2}\d{8}[A-Z]{4})")
 TRAFFIC_COURTS = frozenset({"CT", "TT"})
 # Courts whose second position is a different code from the first.
 SECOND_COURT = {"CJ": "JL"}
@@ -147,6 +155,8 @@ def _find_all(text: str) -> list[str]:
     for m in HIGHLANDS_HARDEE_PATTERN.finditer(stripped):
         if _courts_agree(m.group(2), m.group(3)):
             found.append((m.start(), m.group(1)))
+    if not found:
+        found = [(m.start(), m.group(1)) for m in OLD_POLK_PATTERN.finditer(stripped)]
     return [ucn for _, ucn in sorted(found)]
 
 

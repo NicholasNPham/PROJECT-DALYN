@@ -288,3 +288,25 @@ def test_juvenile_long_form_rebuilds_with_jl():
 def test_juvenile_email_with_no_document_number_uses_email():
     juvenile = "282026CJ000000JLAXMX"
     assert _choose(subject=juvenile, document="Notice of Hearing") == ((juvenile, "subject"), "")
+
+
+def test_old_polk_form_matches_when_no_current_form_is_there():
+    assert ucn.find_all("532009CF00000001XXXX") == ["532009CF00000001XXXX"]
+
+
+def test_old_polk_dashed_form_matches():
+    assert ucn.find_all("Case 53-2009-CF-000000-01XX-XX") == ["532009CF00000001XXXX"]
+
+
+def test_old_polk_form_found_in_the_subject():
+    assert ucn.find_ucn("", subject="RE: 532009CF00000001XXXX Notice") == "532009CF00000001XXXX"
+
+
+def test_old_polk_form_not_tried_when_a_current_form_is_there():
+    text = "532009CF00000001XXXX and 532026CF000000A000XX"
+    assert ucn.find_all(text) == ["532026CF000000A000XX"]
+
+
+def test_old_polk_shape_with_a_highlands_or_hardee_county_is_not_read():
+    assert ucn.find_all("282009CF00000001XXXX") == []
+    assert ucn.find_all("252009CF00000001XXXX") == []

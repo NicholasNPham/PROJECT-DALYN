@@ -72,8 +72,9 @@ def test_old_mail_goes_to_a_person_on_its_first_attempt() -> None:
         ("53-2062-CF-000000-A000-XX", False),
         (HIGHLANDS, True),
         ("282019CF000000CFAXMX", False),
+        ("532009CF00000001XXXX", False),
     ],
-    ids=["this-year", "last-year", "old-year", "future-year", "highlands", "highlands-old"],
+    ids=["this-year", "last-year", "old-year", "future-year", "highlands", "highlands-old", "old-polk-form"],
 )
 def test_year_rule(ucn: str, waits: bool) -> None:
     """Only this year and last year can be a case not built yet."""
