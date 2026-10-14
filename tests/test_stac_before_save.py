@@ -24,7 +24,7 @@ def _session(calls: list[str]) -> StacSession:
     session._select_type_subtype = lambda document_type, subtype: calls.append("type")
     session._save = lambda ucn, subtype, names: calls.append("save")
     session._discard_pending_upload = lambda: calls.append("discard")
-    session._wait_out_spinner = lambda after: None
+    session._wait_out_spinner = lambda after, css=None: None
     session._let_spinner_appear = lambda: calls.append("appear")
     return session
 
@@ -138,3 +138,21 @@ def test_moved_after_one_box_saved_is_partially_entered() -> None:
 
     with pytest.raises(PartiallyEntered, match="email 1 attachment 1 as COURT/ORDERS"):
         runner.enter_email("UCN", TWO_BOXES, before_save=lambda: False)
+
+
+def test_only_the_waits_after_the_upload_ignore_the_preview_pane() -> None:
+    """The upload strands the preview's spinner; before it, a loading preview still counts."""
+    import stac
+
+    calls: list[str] = []
+    waits: list[tuple[str, str | None]] = []
+    session = _session(calls)
+    session._wait_out_spinner = lambda after, css=None: waits.append((after, css))
+
+    session.add_documents("UCN", "COURT", "ORDERS", PATHS)
+
+    assert waits == [
+        ("opening the dropzone", None),
+        ("the upload", stac.SPINNER_OUTSIDE_PREVIEW_CSS),
+        ("picking COURT/ORDERS", stac.SPINNER_OUTSIDE_PREVIEW_CSS),
+    ]

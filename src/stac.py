@@ -392,6 +392,14 @@ return Array.from(document.querySelectorAll(spinnerCss))
 """
 PREVIEW_PANE_CSS = "#imageTabPageSplitterRightPane"
 
+# Spinners outside the preview pane, for the waits after the upload. _upload
+# removes the preview iframe so it cannot intercept Save, and the preview's
+# own loading mask then waits for a frame that is gone. On 14 Oct 2026 live
+# the new log line showed exactly that: in the preview pane, clear of Save.
+# Monday's code never waited on it and saved those pages fine. Save stays
+# guarded by PressWhenUncovered, which names anything that does cover it.
+SPINNER_OUTSIDE_PREVIEW_CSS = f"{SPINNER_CSS}:not({PREVIEW_PANE_CSS} {SPINNER_CSS})"
+
 # Save
 SAVE_BUTTON_ID = "SaveImage"
 SAVED_NOTIFICATION_XPATH = "//div[contains(@class,'c-notification-success')]"
@@ -1012,11 +1020,12 @@ class StacSession:
         self._wait_out_spinner("opening the dropzone")
         self._pause("dropzone open")
         self._upload(paths)
-        self._wait_out_spinner("the upload")
+        self._wait_out_spinner("the upload", SPINNER_OUTSIDE_PREVIEW_CSS)
         self._pause(f"uploaded {names}")
         self._pair = f"{document_type}/{subtype}"
         self._select_type_subtype(document_type, subtype)
-        self._wait_out_spinner(f"picking {self._pair}")
+        # The preview spinner the upload stranded is still there now.
+        self._wait_out_spinner(f"picking {self._pair}", SPINNER_OUTSIDE_PREVIEW_CSS)
 
         if not self.save_enabled:
             self._reach_save_without_pressing(ucn, subtype, names)
@@ -1030,7 +1039,7 @@ class StacSession:
 
         self._save(ucn, subtype, names)
 
-    def _wait_out_spinner(self, after: str) -> None:
+    def _wait_out_spinner(self, after: str, css: str = SPINNER_CSS) -> None:
         """Wait for STAC's loading spinner to clear before the next step.
 
         A step taken while STAC is still loading the last one may be what
@@ -1040,6 +1049,8 @@ class StacSession:
 
         Args:
             after: The step just done, for the log, e.g. "the upload".
+            css: Which spinners count. All of them, unless the step itself
+                stranded one that does not matter.
 
         Raises:
             SystemProblem: If the spinner is still up after upload_timeout.
@@ -1047,12 +1058,12 @@ class StacSession:
                 browser is safe, and it is what cleared the stuck spinner on
                 2026-10-13.
         """
-        if not self._spinner_showing():
+        if not self._spinner_showing(css):
             return
         started = time.monotonic()
         try:
             WebDriverWait(self.driver, self.upload_timeout, poll_frequency=0.25).until(
-                lambda d: not self._spinner_showing()
+                lambda d: not self._spinner_showing(css)
             )
         except TimeoutException as error:
             logger.warning("Spinner still up after %s: %s", after, self._describe_spinners())
@@ -1092,14 +1103,14 @@ class StacSession:
         except TimeoutException:
             pass
 
-    def _spinner_showing(self) -> bool:
-        """True while any Kendo loading spinner on the page is shown.
+    def _spinner_showing(self, css: str = SPINNER_CSS) -> bool:
+        """True while any Kendo loading spinner matching css is shown.
 
         Kendo leaves hidden spinners in the page, so only shown ones count.
         One replaced mid-check counts as showing, to be looked at again.
         """
         try:
-            return any(spinner.is_displayed() for spinner in self.driver.find_elements(By.CSS_SELECTOR, SPINNER_CSS))
+            return any(spinner.is_displayed() for spinner in self.driver.find_elements(By.CSS_SELECTOR, css))
         except StaleElementReferenceException:
             return True
 
