@@ -428,6 +428,13 @@ CAPTION_STOP_WORDS = (
     "division", "ucn", "accused", "respondent",
 )
 
+# Words in a multi-part surname that do not identify anyone on their own, so
+# FIRST DE never stands in for DE-LA-CRUZ, FIRST.
+SURNAME_PARTICLES = frozenset({
+    "DE", "DEL", "DELA", "DA", "DAS", "DO", "DOS", "DI", "DU", "LA", "LAS", "LE",
+    "LOS", "VAN", "VON", "DER", "DEN", "ST", "Y",
+})
+
 # A name needs at least this many usable words before it is worth comparing.
 # One word is a surname on its own, which matches far too much.
 MIN_NAME_TOKENS = 2
@@ -1824,6 +1831,11 @@ def names_match(stac_name: str, document_name: str) -> bool:
         logger.info("Names matched on surname and first name")
         return True
 
+    for part_and_first in _surname_part_sets(stac_name):
+        if _every_word_has_a_near_match(set(part_and_first), document_tokens):
+            logger.info("Names matched on first name and one part of a two-part surname")
+            return True
+
     # Whichever name has fewer words has to be fully accounted for in the
     # other. Going the other way would let a one-word name match anything.
     fewer, more = sorted((stac_tokens, document_tokens), key=len)
@@ -1854,11 +1866,19 @@ def name_in_text(stac_name: str, text: str) -> bool:
     find SMITH, JOHN A, but a SMITH in one sentence and a JOHN three lines on
     do not.
     """
-    required = _required_name_words(stac_name)
-    if len(required) < MIN_NAME_TOKENS or not text:
+    if not text:
         return False
-
     words = re.findall(r"[A-Z]+", text.upper())
+    return any(
+        _named_together(required, words)
+        for required in [_required_name_words(stac_name), *_surname_part_sets(stac_name)]
+    )
+
+
+def _named_together(required: list[str], words: list[str]) -> bool:
+    """True when every required word is in words, all within a few words of each other."""
+    if len(required) < MIN_NAME_TOKENS:
+        return False
     positions = [
         [i for i, word in enumerate(words) if _words_alike(wanted, word)]
         for wanted in required
@@ -1882,6 +1902,31 @@ def _required_name_words(stac_name: str) -> list[str]:
         return _name_words(without_flags)
     last, rest = without_flags.split(",", 1)
     return _name_words(last) + _name_words(rest)[:1]
+
+
+def _surname_part_sets(stac_name: str) -> list[list[str]]:
+    """For a two-part surname, each part with the first name, as fallbacks.
+
+    STAC writes a two-part surname hyphenated, SURA-SURB, FIRST, and filings
+    often print only one part. On 14 Oct 2026 a correct felony filing failed
+    with FIRST SURA in the caption, once the caption ran on into the charge
+    text. Either part with the first name is accepted. A lone particle such
+    as DE or LA is not enough on its own. Empty unless the surname is
+    hyphenated.
+    """
+    without_flags = re.sub(r"\(.*?\)", "", stac_name)
+    if "," not in without_flags:
+        return []
+    last, rest = without_flags.split(",", 1)
+    # Hyphenated only. A spaced surname such as DE LA ROSA keeps needing
+    # every part, as it always has.
+    if "-" not in last:
+        return []
+    parts = _name_words(last)
+    first = _name_words(rest)[:1]
+    if len(parts) < 2 or not first:
+        return []
+    return [[part, *first] for part in parts if part not in SURNAME_PARTICLES]
 
 
 def _name_words(name: str) -> list[str]:

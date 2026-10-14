@@ -115,3 +115,46 @@ def test_multi_word_surname_needs_every_part_in_the_caption() -> None:
     """Every word of the surname is required, as in name_in_text."""
     assert names_match("DE LA ROSA, MARIA ELENA", "MARIA E DE LA ROSA MOTION")
     assert not names_match("DE LA ROSA, MARIA ELENA", "MARIA E ROSA MOTION")
+
+
+# Two-part surnames. STAC writes them hyphenated; filings often print one part.
+TWO_PART = "SURA-SURB, FIRST"
+CHARGE_RUN_ON = "FIRST SURA DUI DAMAGE TO PERSON OR PROPERTY DMG PROP OFFENSE ON"
+
+
+def test_first_part_of_two_part_surname_matches_when_caption_runs_on():
+    """The 14 Oct 2026 felony filing: one surname part, then the charge text."""
+    assert names_match(TWO_PART, CHARGE_RUN_ON)
+
+
+def test_second_part_of_two_part_surname_matches():
+    assert names_match(TWO_PART, "FIRST SURB DUI DAMAGE TO PROPERTY")
+
+
+def test_two_part_surname_with_a_different_first_name_fails():
+    assert not names_match(TWO_PART, "OTHER SURA DUI DAMAGE TO PROPERTY")
+
+
+def test_two_part_surname_with_neither_part_fails():
+    assert not names_match(TWO_PART, "FIRST ELSEWHERE DUI DAMAGE TO PROPERTY")
+
+
+def test_a_lone_particle_does_not_stand_in_for_the_surname():
+    assert not names_match("DE-LA-CRUZ, FIRST", "FIRST DE DUI DAMAGE TO PROPERTY")
+
+
+def test_spaced_multi_word_surname_still_needs_every_part():
+    """Only hyphenated surnames get the one-part rule."""
+    assert not names_match("DE LA ROSA, FIRST", "FIRST ROSA DUI DAMAGE TO PROPERTY")
+
+
+def test_one_part_surname_is_unchanged_by_the_two_part_rule():
+    assert not names_match("DOE, JOHN", "JOHN SMITH DUI DAMAGE TO PROPERTY")
+
+
+def test_highlands_check_finds_one_part_of_a_two_part_surname():
+    assert name_in_text(TWO_PART, "282026CF000000CFAXMX STATE OF FLORIDA VS FIRST SURB - Notice")
+
+
+def test_highlands_check_still_needs_the_first_name_near_the_surname_part():
+    assert not name_in_text(TWO_PART, "SURA filed this. Many lines later the word FIRST appears again here once more")
