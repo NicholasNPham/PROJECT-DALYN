@@ -131,19 +131,24 @@ class FakeSpinner:
 class SpinnerDriver:
     """Finds only the spinner."""
 
-    def __init__(self, spinner: FakeSpinner) -> None:
-        """Hold the spinner."""
+    def __init__(self, spinner: FakeSpinner, where: list[dict] | None = None) -> None:
+        """Hold the spinner, and what the page script reports about where it sits."""
         self.spinner = spinner
+        self.where = where or []
 
     def find_elements(self, by: str, value: str) -> list[FakeSpinner]:
         """Every lookup is the spinner."""
         return [self.spinner]
 
+    def execute_script(self, script: str, *args: str) -> list[dict]:
+        """The only script run here is the one describing the spinners."""
+        return self.where
 
-def _spinner_session(spinner: FakeSpinner, timeout: float = 5) -> StacSession:
+
+def _spinner_session(spinner: FakeSpinner, timeout: float = 5, where: list[dict] | None = None) -> StacSession:
     """A session whose page holds just the spinner."""
     session = StacSession.__new__(StacSession)
-    session.driver = SpinnerDriver(spinner)
+    session.driver = SpinnerDriver(spinner, where)
     session.upload_timeout = timeout
     return session
 
@@ -220,3 +225,19 @@ def test_no_spinner_in_the_window_goes_on(monkeypatch: pytest.MonkeyPatch) -> No
     _spinner_session(spinner)._let_spinner_appear()
 
     assert spinner.checks > 1
+
+
+def test_stuck_spinner_logs_where_it_sits(caplog: pytest.LogCaptureFixture) -> None:
+    """The warning says preview pane or not, Save or not, with digits masked."""
+    where = [{"chain": "div#image-4471.k-loading-mask < div#imageTabPageSplitterRightPane", "preview": True, "covers_save": False}]
+
+    with caplog.at_level(logging.WARNING, logger="dalyn.stac"), pytest.raises(SystemProblem):
+        _spinner_session(FakeSpinner(shown=10**6), timeout=0.1, where=where)._wait_out_spinner("the upload")
+
+    assert "[in the preview pane, clear of Save] div#image-#.k-loading-mask" in caplog.text
+    assert "4471" not in caplog.text
+
+
+def test_spinner_gone_by_the_time_it_is_described() -> None:
+    """Cleared between the timeout and the look: said plainly, not an error."""
+    assert _spinner_session(FakeSpinner(shown=0))._describe_spinners() == "none shown any more"

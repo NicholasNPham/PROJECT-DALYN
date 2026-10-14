@@ -365,6 +365,33 @@ SPINNER_CSS = ".k-loading-image"
 # tile to click, and the check right after the click had seen no spinner.
 SPINNER_APPEAR_SECONDS = 2
 
+# Where each shown spinner sits, for the log when one will not clear: its
+# parents by tag, id and class, whether it is inside the preview pane, and
+# whether it overlaps Save. Markup only, never page text. On 2026-10-13 live,
+# 21 spinners stuck after the upload, nearly all on reused case pages, while
+# Monday's code, which never looked for spinners, saved those pages fine.
+# The arguments are copied out first: inside the map callback, `arguments`
+# is the callback's own.
+DESCRIBE_SPINNERS_JS = """
+var spinnerCss = arguments[0], saveId = arguments[1], paneCss = arguments[2];
+var save = document.getElementById(saveId);
+var s = save ? save.getBoundingClientRect() : null;
+return Array.from(document.querySelectorAll(spinnerCss))
+  .filter(function (e) { return e.getClientRects().length > 0; })
+  .map(function (e) {
+    var chain = [], n = e.parentElement;
+    while (n && chain.length < 5) {
+      chain.push(n.tagName.toLowerCase() + (n.id ? '#' + n.id : '')
+        + (n.classList.length ? '.' + Array.from(n.classList).slice(0, 2).join('.') : ''));
+      n = n.parentElement;
+    }
+    var r = e.getBoundingClientRect();
+    var covers = !!s && r.left < s.right && r.right > s.left && r.top < s.bottom && r.bottom > s.top;
+    return {chain: chain.join(' < '), preview: !!e.closest(paneCss), covers_save: covers};
+  });
+"""
+PREVIEW_PANE_CSS = "#imageTabPageSplitterRightPane"
+
 # Save
 SAVE_BUTTON_ID = "SaveImage"
 SAVED_NOTIFICATION_XPATH = "//div[contains(@class,'c-notification-success')]"
@@ -1028,10 +1055,28 @@ class StacSession:
                 lambda d: not self._spinner_showing()
             )
         except TimeoutException as error:
+            logger.warning("Spinner still up after %s: %s", after, self._describe_spinners())
             raise SystemProblem(
                 f"STAC's loading spinner was still up {self.upload_timeout}s after {after}."
             ) from error
         logger.info("STAC's loading spinner cleared %.1fs after %s", time.monotonic() - started, after)
+
+    def _describe_spinners(self) -> str:
+        """Say where each shown spinner sits, for the log. Never raises.
+
+        Digits are masked, since an element id can carry a record number.
+        """
+        try:
+            spinners = self.driver.execute_script(DESCRIBE_SPINNERS_JS, SPINNER_CSS, SAVE_BUTTON_ID, PREVIEW_PANE_CSS)
+        except WebDriverException as error:
+            return f"could not describe them ({type(error).__name__})"
+        if not spinners:
+            return "none shown any more"
+        return "; ".join(
+            f"[{'in the preview pane' if s['preview'] else 'outside the preview pane'}, "
+            f"{'covers Save' if s['covers_save'] else 'clear of Save'}] {re.sub(r'[0-9]+', '#', s['chain'])}"
+            for s in spinners
+        )
 
     def _let_spinner_appear(self) -> None:
         """Give a spinner that has not shown yet a moment to show.
