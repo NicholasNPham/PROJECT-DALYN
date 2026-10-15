@@ -79,6 +79,15 @@ SEARCH_CRITERIA_UCN_XPATH = (
 SEARCH_FIELD_ID = "incidentsSearchMainSearchValue"
 SEARCH_BUTTON_ID = "incidentsSearchMainButton"
 NO_RECORDS_CSS = ".k-grid-norecords-template"
+# Clears the case list and the open case without a reload. Only a mouse
+# move then click presses it: a plain Selenium click and a JavaScript click
+# both did nothing in test STAC on 14 Oct 2026, while a person's click did.
+REMOVE_FROM_LIST_ID = "incidentsListMainListRemoveItem"
+RESET_CLEAR_SECONDS = 3
+# A "no records" read straight after a reset can be the cleared grid, not
+# the search. The 14 Oct 2026 try_reset.py run read it twice for cases that
+# were there, both found on a second look once loading finished.
+NO_RECORDS_RECHECK_SECONDS = 5
 CASE_DEFENDANT_NAME_CSS = "td[data-original-column-name='Def_Name'] span.k-button-text"
 IMAGES_TAB_ID = "incidentsTab-tab-3"
 
@@ -525,6 +534,9 @@ class StacSession:
         self._pair = ""
         # Set by find_case. Empty means no case is open in this browser.
         self._case_url = ""
+        # True once any search has run here, found or not. A search that
+        # found nothing still leaves the page needing a reset (14 Oct 2026).
+        self._searched = False
 
     def __enter__(self) -> "StacSession":
         self.open()
@@ -739,9 +751,20 @@ class StacSession:
         So the sidebar is tried first, and if the box is not usable the page
         is loaded fresh, which always works.
 
+        When a case is already open in this browser, Remove from List is
+        tried before either, since it clears the case in place with no
+        reload. Only reached with fresh_browser off; a fresh browser has no
+        case open.
+
         Raises:
             SystemProblem: If the search box cannot be reached either way.
         """
+        if self._case_url or self._searched:
+            if self._reset_search():
+                logger.info("Reset the case search with Remove from List")
+                return
+            logger.info("Remove from List did not reset the search; trying the sidebar")
+
         if self._try_open_case_search():
             return
 
@@ -759,6 +782,40 @@ class StacSession:
             raise SystemProblem(
                 "STAC's case search box is still not usable after reloading the page."
             )
+
+    def _reset_search(self) -> bool:
+        """Press Remove from List and check the search box is ready. Never raises.
+
+        The search criteria stay on UCN after it (seen 14 Oct 2026), so
+        _criteria_is_ucn is left alone. The old case number stays in the
+        box; _search_ucn empties it.
+
+        Returns:
+            False on any doubt, and the caller falls back to the sidebar and
+            then a reload, as before this existed.
+        """
+        try:
+            button = self.wait.until(EC.element_to_be_clickable((By.ID, REMOVE_FROM_LIST_ID)))
+            ActionChains(self.driver).move_to_element(button).pause(0.3).click().perform()
+            WebDriverWait(self.driver, RESET_CLEAR_SECONDS, poll_frequency=0.25).until(
+                lambda d: not self._case_rows_showing()
+            )
+            self._let_spinner_appear()
+            self._wait_out_spinner("Remove from List")
+            field = self.wait.until(EC.element_to_be_clickable((By.ID, SEARCH_FIELD_ID)))
+            return field.is_enabled() and field.is_displayed()
+        except (TimeoutException, WebDriverException, SystemProblem) as error:
+            # SystemProblem is a spinner that would not clear. The reload
+            # fallback clears that, so it is not worth stopping for here.
+            logger.info("Remove from List reset failed (%s)", type(error).__name__)
+            return False
+
+    def _case_rows_showing(self) -> bool:
+        """True while a case row is on screen. Hidden Kendo markup does not count."""
+        try:
+            return any(row.is_displayed() for row in self.driver.find_elements(By.CSS_SELECTOR, CASE_DEFENDANT_NAME_CSS))
+        except StaleElementReferenceException:
+            return True
 
     def _try_open_case_search(self) -> bool:
         """One attempt at reaching a usable search box. False if it is not ready."""
@@ -818,9 +875,15 @@ class StacSession:
             SystemProblem: If the results never load.
         """
         try:
+            self._searched = True
             field = self.wait.until(EC.element_to_be_clickable((By.ID, SEARCH_FIELD_ID)))
-            field.clear()
             field.click()
+            # Ctrl+A and Delete, not clear(). clear() left the last case
+            # number in the box after a reset, and after a "no records"
+            # search it refused the box outright ("invalid element state"),
+            # which cost a browser restart in the 14 Oct 2026 run.
+            field.send_keys(Keys.CONTROL, "a")
+            field.send_keys(Keys.DELETE)
             field.send_keys(ucn)
             button = self.driver.find_element(By.ID, SEARCH_BUTTON_ID)
             self.driver.execute_script("arguments[0].click();", button)
@@ -838,7 +901,7 @@ class StacSession:
         except TimeoutException as error:
             raise SystemProblem(f"STAC's search results never loaded for {ucn}.") from error
 
-        if self.driver.find_elements(By.CSS_SELECTOR, NO_RECORDS_CSS):
+        if self.driver.find_elements(By.CSS_SELECTOR, NO_RECORDS_CSS) and not self._found_on_second_look(ucn):
             raise CaseNotFound(
                 f"No case in STAC with case number {ucn}. Either the number was "
                 "read wrong or the case is not in this instance."
@@ -862,6 +925,26 @@ class StacSession:
             raise SystemProblem(
                 f"Search for {ucn} returned a row with no defendant name."
             ) from error
+
+    def _found_on_second_look(self, ucn: str) -> bool:
+        """Look again for a result row before believing "no records".
+
+        A case wrongly reported missing goes to Manual Review, so a few
+        seconds on each real miss is the cheaper mistake.
+
+        Raises:
+            SystemProblem: If STAC's spinner never clears.
+        """
+        self._let_spinner_appear()
+        self._wait_out_spinner(f"the search for {ucn}")
+        try:
+            WebDriverWait(self.driver, NO_RECORDS_RECHECK_SECONDS, poll_frequency=0.25).until(
+                lambda d: self._case_rows_showing()
+            )
+        except TimeoutException:
+            return False
+        logger.info("%s: \"no records\" was read before the results loaded; found on a second look", ucn)
+        return True
 
     def _check_defendant(self, ucn: str, stac_name: str, document_text: str) -> None:
         """Compare STAC's defendant against the name in the document's caption.
@@ -2127,7 +2210,7 @@ class StacRunner:
         A wedged Kendo dialog or a half-loaded page does not recover from
         another click. Starting over is what actually works the second time.
         """
-        logger.debug("Restarting the STAC browser session")
+        logger.info("Restarting the STAC browser session")
         if self.session:
             self.session.close()
         self._start_session()
@@ -2141,9 +2224,21 @@ class StacRunner:
         which is what "Element is not currently interactable" was: email 1's
         wreckage, charged to emails 2 and 3.
 
+        With fresh_browser off the page is refreshed instead, which keeps the
+        sign-in and drops a half-filled upload or open dialog the same way.
+        The next search then resets with Remove from List. Only a refresh
+        that fails falls back to the restart.
+
         Never allowed to raise. Whatever went wrong before this is the error
         worth reporting, not a browser that would not restart.
         """
+        if not self.fresh_browser and getattr(self.session, "driver", None):
+            try:
+                self.session._discard_pending_upload()
+                logger.info("Refreshed the STAC page after the failure, keeping the browser")
+                return
+            except SystemProblem as error:
+                logger.info("Refresh after the failure did not work (%s); restarting", error)
         try:
             self._restart_session()
         except Exception as error:  # noqa: BLE001
@@ -2249,7 +2344,13 @@ class StacRunner:
                 # Both are this document's problem, and neither improves by
                 # trying again. SaveMayHaveHappened especially: a retry is
                 # exactly what would file it twice.
-                self._leave_browser_clean()
+                if isinstance(error, CaseNotFound) and not self.fresh_browser:
+                    # A missed search leaves only an empty result list, which
+                    # the next search starts from. Restarting for that cost a
+                    # sign-in per missing case in the 14 Oct 2026 test batch.
+                    logger.info("%s: not found; keeping the browser for the next email", ucn)
+                else:
+                    self._leave_browser_clean()
                 # A later box failing after an earlier one was saved must say
                 # so. Raised bare, a CaseNotFound would be held and searched
                 # again later, and the saved box filed a second time.
