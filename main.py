@@ -231,6 +231,43 @@ def _is_pdf(data: bytes) -> bool:
 
 
 def _read_and_classify(pdf_bytes: bytes, label: str, rules: list):
+    """Read and classify as _first_reads does, then one last try if nothing matched.
+
+    The last try OCRs the first pages with the underline cleanup off and is
+    kept only if it matches a rule. Otherwise everything _first_reads
+    returned is returned unchanged, so a document that matched before, or
+    went to Manual Review before, still does. See ocr.ocr_without_cleanup
+    for the document that needed it.
+
+    UCNs the last try finds go after the earlier ones: its text is rougher,
+    so it does not get first say on the case number.
+
+    Returns and raises as _first_reads. retried is also True when the last
+    try is what matched.
+    """
+    text, source, result, retried, document_ucns, document_refs = _first_reads(pdf_bytes, label, rules)
+    if result.matched_phrase:
+        return text, source, result, retried, document_ucns, document_refs
+
+    try:
+        raw_text = ocr.ocr_without_cleanup(pdf_bytes, label)
+    except DocumentProblem as error:
+        logger.info("%s: OCR without the underline cleanup failed, keeping the earlier result (%s)", label, error)
+        return text, source, result, retried, document_ucns, document_refs
+
+    raw_result = classifier.classify(rules, raw_text)
+    if not raw_result.matched_phrase:
+        logger.info("%s: no rule matched without the underline cleanup either", label)
+        return text, source, result, retried, document_ucns, document_refs
+
+    logger.info("%s: matched rules row %s only with the underline cleanup off", label, raw_result.rule_row)
+    raw_ucns = ucn.find_all(raw_text)
+    document_ucns = list(dict.fromkeys(document_ucns + raw_ucns))
+    document_refs = list(dict.fromkeys(document_refs + ucn.find_document_refs(raw_text, raw_ucns)))
+    return raw_text, TextSource.OCR, raw_result, True, document_ucns, document_refs
+
+
+def _first_reads(pdf_bytes: bytes, label: str, rules: list):
     """Extract text, classify, and find the document UCN. Mirrors review_batch.py.
 
     If the embedded text matched no rule at all, retry once through forced

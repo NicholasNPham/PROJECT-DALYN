@@ -103,6 +103,18 @@ def report(pdf: Path, rules: list, keyword: str | None, show_lines: bool) -> Non
         text, source = extract_text(pdf.read_bytes(), pdf.name, force_ocr=True)
         result = classifier.classify(rules, text)
 
+    # main.py's last try, mirrored for the same reason: OCR without the
+    # underline cleanup, kept only if it matches.
+    if not result.matched_phrase:
+        print("  no rule matched, retrying OCR without the underline cleanup\n")
+        raw_text = ocr.ocr_without_cleanup(pdf.read_bytes(), pdf.name)
+        raw_result = classifier.classify(rules, raw_text)
+        if raw_result.matched_phrase:
+            print("  matched only with the underline cleanup off\n")
+            text, source, result = raw_text, "ocr", raw_result
+        else:
+            print("  no match without the cleanup either, showing the earlier read\n")
+
     lines = classifier.document_lines(text)
     title_lines = lines[: classifier.TITLE_REGION_LINES]
 

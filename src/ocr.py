@@ -196,6 +196,30 @@ def extract_text(pdf_bytes: bytes, filename: str, force_ocr: bool = False) -> tu
     return _ocr(pdf_bytes, filename), "ocr"
 
 
+def ocr_without_cleanup(pdf_bytes: bytes, filename: str) -> str:
+    """OCR the first pages with the underline cleanup switched off.
+
+    The last try for a document nothing else classified. The cleanup fixes
+    garbled underlined titles (batch 5), but on the 14 Oct 2026 test batch's
+    motion to terminate probation the underline sat so tight against the
+    title that whitening it clipped the letters, and Tesseract dropped the
+    line. The same page read without the cleanup gave the title cleanly.
+
+    Only the first FORCE_OCR_PAGE_LIMIT pages, like the forced retry, since
+    this too is only looking for a heading.
+
+    Raises:
+        DocumentProblem: If the PDF cannot be rendered or OCR produces nothing.
+        SystemProblem: If Tesseract is missing.
+    """
+    logger.info(
+        "%s: OCR of the first %s pages without the underline cleanup",
+        filename,
+        FORCE_OCR_PAGE_LIMIT,
+    )
+    return _ocr(pdf_bytes, filename, page_limit=FORCE_OCR_PAGE_LIMIT, strip_rules=False)
+
+
 def _extract_embedded(pdf_bytes: bytes, filename: str) -> tuple[str, int]:
     """Read the PDF's own text layer.
 
@@ -306,7 +330,7 @@ def _is_readable(text: str) -> bool:
     return True
 
 
-def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None) -> str:
+def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None, strip_rules: bool = True) -> str:
     """Read a scanned PDF by rendering its pages and running Tesseract on them.
 
     Slower than reading a text layer, roughly five to ten seconds per page.
@@ -317,6 +341,8 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None) -> str:
         filename: Attachment name, for logging and error messages.
         page_limit: Stop after this many pages. None reads the whole document.
             Used by the forced retry, which is only ever looking for a heading.
+        strip_rules: Paint out underlines before OCR. Off only for
+            ocr_without_cleanup.
 
     Returns:
         The OCR'd text, pages joined by newlines.
@@ -340,7 +366,7 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None) -> str:
                 break
 
             try:
-                image = _page_image(page.get_pixmap(dpi=OCR_DPI), filename, number)
+                image = _page_image(page.get_pixmap(dpi=OCR_DPI), filename, number, strip_rules)
                 pages.append(pytesseract.image_to_string(image, config=TESSERACT_CONFIG))
             except pytesseract.TesseractNotFoundError as error:
                 # An environment failure, not a bad document. Stop DALYN rather
@@ -368,7 +394,7 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None) -> str:
     return text
 
 
-def _page_image(pixmap, filename: str, page_number: int):
+def _page_image(pixmap, filename: str, page_number: int, strip_rules: bool = True):
     """Turn a rendered page into an image array, with underlines painted out.
 
     Underlined headings are the norm in these filings, and on a scan the rule
@@ -382,6 +408,7 @@ def _page_image(pixmap, filename: str, page_number: int):
         pixmap: The rendered page from pymupdf.
         filename: For logging only.
         page_number: For logging only.
+        strip_rules: False returns the page as rendered, no cleanup.
 
     Returns:
         An RGB numpy array, which pytesseract accepts directly.
@@ -394,6 +421,9 @@ def _page_image(pixmap, filename: str, page_number: int):
         image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
     elif pixmap.n == 1:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+    if not strip_rules:
+        return image
 
     try:
         grey = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
