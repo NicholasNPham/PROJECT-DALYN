@@ -1,4 +1,13 @@
-from classifier import TITLE_ONLY_PHRASES, TITLE_REGION_LINES, Rule, classify, compress, normalize
+from classifier import (
+    TITLE_CONTAINS_PHRASES,
+    TITLE_ONLY_PHRASES,
+    TITLE_REGION_LINES,
+    Rule,
+    _name_gap_pattern,
+    classify,
+    compress,
+    normalize,
+)
 from models import ClassificationResult
 
 
@@ -12,8 +21,9 @@ def _rule(phrase: str, document_type: str | None, subtype: str | None, row: int,
         document_type=document_type,
         document_subtype=subtype,
         fuzzy=fuzzy,
-        title_only=normalized in TITLE_ONLY_PHRASES,
+        title_only=normalized in TITLE_ONLY_PHRASES or normalized in TITLE_CONTAINS_PHRASES,
         row=row,
+        title_contains=normalized in TITLE_CONTAINS_PHRASES,
     )
 
 
@@ -51,6 +61,89 @@ def test_title_only_rule_ignores_lines_past_the_title_region() -> None:
     body = "\n".join(["filler line"] * TITLE_REGION_LINES + ["Order granting the motion"])
 
     assert classify(rules, body) == ClassificationResult()
+
+
+def test_notice_of_participation_matches_after_the_defendants_name() -> None:
+    """The defense heading puts the name first, so the phrase is mid-line."""
+    rules = [_rule("NOTICE OF PARTICIPATION", "DISCOVERY", "DEPOSITION", 2)]
+    text = "STATE OF FLORIDA\nDEFENDANT JOHN DOE NOTICE OF PARTICIPATION AT DEPOSITIONS"
+
+    assert classify(rules, text).rule_row == 2
+
+
+def test_notice_of_participation_is_ignored_past_the_title_region() -> None:
+    """Mid-line matching is for titles only, not a mention deep in the body."""
+    rules = [_rule("NOTICE OF PARTICIPATION", "DISCOVERY", "DEPOSITION", 2)]
+    body = "\n".join(["filler line"] * TITLE_REGION_LINES + ["see the notice of participation filed earlier"])
+
+    assert classify(rules, body) == ClassificationResult()
+
+
+def test_notice_of_participation_needs_whole_words() -> None:
+    """Part of a longer word does not count as the phrase."""
+    rules = [_rule("NOTICE OF PARTICIPATION", "DISCOVERY", "DEPOSITION", 2)]
+
+    assert classify(rules, "DEFENDANT NOTICE OF PARTICIPATIONS") == ClassificationResult()
+
+
+def _gap_rule(phrase: str, row: int = 2) -> Rule:
+    """A * rule, built the way load_rules builds one."""
+    return Rule(
+        phrase=phrase,
+        normalized=phrase.lower(),
+        compressed="",
+        document_type="DISCOVERY",
+        document_subtype="DEFNS DSCL",
+        fuzzy=False,
+        title_only=True,
+        row=row,
+        name_gap=_name_gap_pattern(phrase),
+    )
+
+
+def test_name_gap_matches_a_name_between_the_words() -> None:
+    """The defense title that started it: the name sits mid-heading."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    assert classify(rules, "STATE OF FLORIDA\nDefendant John Q Doe's Witness List").rule_row == 2
+
+
+def test_name_gap_matches_with_no_name() -> None:
+    """The same title without a name still matches."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    assert classify(rules, "Defendant's Witness List").rule_row == 2
+    assert classify(rules, "Defendant Witness List").rule_row == 2
+
+
+def test_name_gap_will_not_swallow_a_different_document() -> None:
+    """A motion about a witness list is a motion, not a witness list."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    assert classify(rules, "Defendant's Motion to Strike State's Witness List") == ClassificationResult()
+    assert classify(rules, "Defendant's Objection Witness List") == ClassificationResult()
+
+
+def test_name_gap_is_at_most_four_words() -> None:
+    """A long run of words is a sentence, not a name."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    assert classify(rules, "Defendant one two three four five witness list") == ClassificationResult()
+
+
+def test_name_gap_looks_only_in_the_title_region() -> None:
+    """Like the catch-alls, a * rule is for titles only."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+    body = "\n".join(["filler line"] * TITLE_REGION_LINES + ["Defendant John Doe's witness list"])
+
+    assert classify(rules, body) == ClassificationResult()
+
+
+def test_name_gap_needs_words_on_both_sides() -> None:
+    """A * at either end, or two of them, is refused."""
+    assert _name_gap_pattern("* WITNESS LIST") is None
+    assert _name_gap_pattern("DEFENDANT *") is None
+    assert _name_gap_pattern("DEFENDANT * WITNESS * LIST") is None
 
 
 def test_fuzzy_rule_matches_ocr_mangled_heading() -> None:

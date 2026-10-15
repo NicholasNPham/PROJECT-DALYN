@@ -75,6 +75,27 @@ MIN_FUZZY_LENGTH = 14
 TITLE_REGION_LINES = 25
 TITLE_ONLY_PHRASES = frozenset({"order", "motion", "judgment", "memorandum of law"})
 
+# Phrases that may sit anywhere in a title line, not only at its start. Kept
+# to the title region, since mid-line anywhere in a document is exactly what
+# starts-with exists to avoid. A defense notice of participation at
+# depositions in the 14 Oct 2026 test batch put the defendant's name first,
+# "defendant <name> notice of participation", so no phrase could start it.
+TITLE_CONTAINS_PHRASES = frozenset({"notice of participation"})
+
+# A * in a phrase stands in for the defendant's name, which defense titles
+# put in the middle: "defendant <name> s witness list" in the 14 Oct 2026
+# test batch. Written in the sheet as DEFENDANT * WITNESS LIST. The gap is
+# limited so it cannot swallow real title words: at most four words (first,
+# middle, last and a possessive s), and none that begin another document,
+# or "motion to strike state s witness list" would file as a witness list.
+# Only rows written with a * behave this way; every other row is unchanged.
+NAME_GAP = "*"
+NAME_GAP_MAX_WORDS = 4
+NAME_GAP_STOP_WORDS = frozenset({
+    "motion", "response", "objection", "strike", "exclude", "notice", "order",
+    "reply", "opposition", "to", "of", "for", "on", "in",
+})
+
 logger = get_logger(__name__)
 
 
@@ -90,6 +111,8 @@ class Rule:
     fuzzy: bool
     title_only: bool
     row: int
+    title_contains: bool = False
+    name_gap: re.Pattern | None = None
 
 
 def normalize(text: str) -> str:
@@ -175,6 +198,20 @@ def load_rules(excel_path: Path) -> list[Rule]:
                 )
                 continue
 
+            name_gap = None
+            if NAME_GAP in str(phrase):
+                name_gap = _name_gap_pattern(str(phrase))
+                if name_gap is None:
+                    logger.warning(
+                        "Rules row %s (%r): a * needs words on both sides and only one *. Skipped.",
+                        row_number,
+                        phrase,
+                    )
+                    continue
+                # Kept with the * so it never equals, or is taken for a
+                # duplicate of, the same words written without a gap.
+                normalized = f" {NAME_GAP} ".join(normalize(part) for part in str(phrase).split(NAME_GAP))
+
             if normalized in seen:
                 logger.warning(
                     "Rules row %s repeats the phrase from row %s (%r). "
@@ -199,6 +236,16 @@ def load_rules(excel_path: Path) -> list[Rule]:
                 )
                 fuzzy = False
 
+            if fuzzy and name_gap:
+                # Fuzzy compares a fixed run of characters, which a name of
+                # any length breaks.
+                logger.warning(
+                    "Rules row %s (%r) has a * and is marked Fuzzy. It will be matched exactly only.",
+                    row_number,
+                    phrase,
+                )
+                fuzzy = False
+
             document_type = _cell(row, COL_TYPE)
             document_subtype = _cell(row, COL_SUBTYPE)
 
@@ -216,8 +263,16 @@ def load_rules(excel_path: Path) -> list[Rule]:
                     document_type=document_type,
                     document_subtype=document_subtype,
                     fuzzy=fuzzy,
-                    title_only=normalized in TITLE_ONLY_PHRASES,
+                    # A * rule is a title with a name in it, so it looks only
+                    # where a title can be.
+                    title_only=(
+                        normalized in TITLE_ONLY_PHRASES
+                        or normalized in TITLE_CONTAINS_PHRASES
+                        or name_gap is not None
+                    ),
                     row=row_number,
+                    title_contains=normalized in TITLE_CONTAINS_PHRASES,
+                    name_gap=name_gap,
                 )
             )
     finally:
@@ -299,13 +354,42 @@ def _match_exact(
 ) -> ClassificationResult | None:
     """Return the first rule whose phrase starts a line, or None.
 
-    A title-only rule sees just the first TITLE_REGION_LINES lines.
+    A title-only rule sees just the first TITLE_REGION_LINES lines. A
+    title-contains rule may also match mid-line there, on whole words.
     """
     for rule in rules:
         for line in title_lines if rule.title_only else lines:
             if line.startswith(rule.normalized):
                 return _result(rule, line, 1.0)
+            # Padded so "notice of participation" cannot match inside a
+            # longer word on either side.
+            if rule.title_contains and f" {rule.normalized} " in f" {line} ":
+                return _result(rule, line, 1.0)
+            if rule.name_gap and rule.name_gap.match(line):
+                return _result(rule, line, 1.0)
     return None
+
+
+def _name_gap_pattern(phrase: str) -> re.Pattern | None:
+    """Build the match for a phrase with a * standing in for a name.
+
+    DEFENDANT * WITNESS LIST matches a line that starts "defendant", then up
+    to NAME_GAP_MAX_WORDS words none of them in NAME_GAP_STOP_WORDS, then
+    "witness list". Zero words is allowed, so a title with no name matches.
+
+    Returns:
+        The compiled pattern, or None if the phrase does not have exactly
+        one * with words on both sides.
+    """
+    parts = phrase.split(NAME_GAP)
+    if len(parts) != 2:
+        return None
+    before, after = normalize(parts[0]), normalize(parts[1])
+    if not before or not after:
+        return None
+    stop = "|".join(sorted(NAME_GAP_STOP_WORDS))
+    word = rf"(?!(?:{stop})\b)[a-z0-9]+"
+    return re.compile(rf"{re.escape(before)}(?: {word}){{0,{NAME_GAP_MAX_WORDS}}} {re.escape(after)}")
 
 
 def _match_fuzzy(
