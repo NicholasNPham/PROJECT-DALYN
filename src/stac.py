@@ -460,6 +460,13 @@ SURNAME_PARTICLES = frozenset({
     "LOS", "VAN", "VON", "DER", "DEN", "ST", "Y",
 })
 
+# Generational suffixes. STAC writes them on the surname, SURNAME JR, FIRST,
+# and filings print them anywhere or not at all, so a suffix is never a word
+# that must be found. Two different ones do mean two different people: a
+# father and son share every other part of the name. V is left out because
+# it is far more often a middle initial.
+NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV"})
+
 # A name needs at least this many usable words before it is worth comparing.
 # One word is a surname on its own, which matches far too much.
 MIN_NAME_TOKENS = 2
@@ -1957,6 +1964,14 @@ def names_match(stac_name: str, document_name: str) -> bool:
     if not stac_tokens or not document_tokens:
         return False
 
+    # When the name can be found as a name, laid out the way STAC has it,
+    # that settles it either way. It is the one place a middle name or
+    # suffix can be compared, so it is the one place a conflicting one
+    # (JOHN B against STAC's ALLEN, JR against SR) is caught.
+    verdict = _laid_out_name_match(stac_name, document_name)
+    if verdict is not None:
+        return verdict
+
     if stac_tokens.issubset(document_tokens) or document_tokens.issubset(stac_tokens):
         return True
 
@@ -1984,6 +1999,130 @@ def names_match(stac_name: str, document_name: str) -> bool:
         return True
 
     return False
+
+
+def _laid_out_name_match(stac_name: str, document_name: str) -> bool | None:
+    """Compare a caption against STAC's LAST SUFFIX, FIRST MIDDLE word by word.
+
+    Finds STAC's surname and first name in the caption, next to each other in
+    either order (FIRST M LAST JR, or LAST, FIRST M). An initial counts for a
+    whole name either way: J for JOHN, or STAC's A for a caption's ALLEN.
+    Then whatever sits in the middle-name and suffix places must agree with
+    STAC. Missing is fine, since filings often drop a middle name or a JR.
+    Different is not.
+
+    On 16 Oct 2026 a correct misdemeanor filing failed because STAC had the
+    suffix on the surname and the caption did not print it, so JR was a
+    required word. The same rules also let JOHN B through against STAC's
+    ALLEN, because the middle name was never looked at.
+
+    Returns:
+        True or False when the name was found and judged. None when STAC's
+        name has no comma or the caption does not lay the name out
+        recognisably, so the looser checks in names_match decide instead.
+    """
+    stac = _parse_stac_name(stac_name)
+    if stac is None:
+        return None
+    surname, suffix, first, middles = stac
+    words = _caption_words(document_name)
+
+    for start in range(len(words)):
+        if not _surname_at(surname, words, start):
+            continue
+        end = start + len(surname) - 1
+
+        # FIRST [MIDDLE ...] SURNAME [SUFFIX]. One spare word between, for a
+        # second middle name STAC does not have.
+        for at in range(max(0, start - len(middles) - 2), start):
+            if _given_alike(first, words[at]):
+                between = [w for w in words[at + 1:start] if w not in NAME_SUFFIXES]
+                after = words[end + 1:end + 2]
+                return _middles_agree(middles, between) and _suffixes_agree(suffix, after)
+
+        # SURNAME [SUFFIX], FIRST [MIDDLE ...]. Only initials, or words close
+        # to STAC's middle names, are judged after the first name: a whole
+        # word there may be the title running on, and MOTION is not a
+        # conflicting middle name.
+        after_surname = words[end + 1:]
+        offset = 1 if after_surname[:1] and after_surname[0] in NAME_SUFFIXES else 0
+        if len(after_surname) > offset and _given_alike(first, after_surname[offset]):
+            rest = after_surname[offset + 1:]
+            trailing = []
+            for word in rest[:len(middles)]:
+                if word in NAME_SUFFIXES:
+                    break
+                if len(word) == 1 or any(_given_alike(m, word) for m in middles):
+                    trailing.append(word)
+                else:
+                    break
+            suffix_words = after_surname[:offset] or rest[len(trailing):len(trailing) + 1]
+            return _middles_agree(middles, trailing) and _suffixes_agree(suffix, suffix_words)
+
+    return None
+
+
+def _parse_stac_name(stac_name: str) -> tuple[list[str], str | None, str, list[str]] | None:
+    """Split STAC's LAST SUFFIX, FIRST MIDDLE into its parts, initials kept.
+
+    Returns:
+        (surname words, suffix or None, first name, middle names), or None
+        when there is no comma or no first name to anchor on.
+    """
+    without_flags = re.sub(r"\(.*?\)", "", stac_name)
+    if "," not in without_flags:
+        return None
+    last, rest = without_flags.split(",", 1)
+    last_words = _caption_words(last)
+    given = _caption_words(rest)
+    suffixes = [w for w in last_words + given if w in NAME_SUFFIXES]
+    surname = [w for w in last_words if w not in NAME_SUFFIXES]
+    given = [w for w in given if w not in NAME_SUFFIXES]
+    if not surname or not given:
+        return None
+    return surname, (suffixes[0] if suffixes else None), given[0], given[1:]
+
+
+def _caption_words(text: str) -> list[str]:
+    """Uppercase words in order, initials kept, STAC's flag words dropped."""
+    return [
+        word
+        for word in re.findall(r"[A-Z]+", re.sub(r"\(.*?\)", "", text).upper())
+        if word not in EXCLUDED_NAME_TOKENS
+    ]
+
+
+def _surname_at(surname: list[str], words: list[str], start: int) -> bool:
+    """True when every surname word sits at words[start:], in order, near enough."""
+    if len(words) - start < len(surname):
+        return False
+    return all(
+        len(want) > 1 and SequenceMatcher(None, want, got).ratio() >= NAME_TOKEN_SIMILARITY
+        for want, got in zip(surname, words[start:])
+    )
+
+
+def _given_alike(want: str, got: str) -> bool:
+    """True when two given names agree: near the same, or an initial of the other."""
+    if len(want) == 1 or len(got) == 1:
+        return want[0] == got[0]
+    return SequenceMatcher(None, want, got).ratio() >= NAME_TOKEN_SIMILARITY
+
+
+def _middles_agree(middles: list[str], found: list[str]) -> bool:
+    """True unless a middle name in the caption contradicts STAC's in the same place.
+
+    Paired in order. A caption with fewer middle names than STAC, or none,
+    agrees. So does one with more, or STAC having none: nothing says they
+    differ.
+    """
+    return all(_given_alike(want, got) for want, got in zip(middles, found))
+
+
+def _suffixes_agree(suffix: str | None, found: list[str]) -> bool:
+    """True unless both sides carry a suffix and they differ, as JR and SR do."""
+    found_suffix = next((w for w in found if w in NAME_SUFFIXES), None)
+    return suffix is None or found_suffix is None or found_suffix == suffix
 
 
 def _every_word_has_a_near_match(fewer: set, more: set) -> bool:
@@ -2041,7 +2180,10 @@ def _required_name_words(stac_name: str) -> list[str]:
     if "," not in without_flags:
         return _name_words(without_flags)
     last, rest = without_flags.split(",", 1)
-    return _name_words(last) + _name_words(rest)[:1]
+    # STAC puts JR on the surname, and filings often leave it off. Required,
+    # it failed a correct filing on 16 Oct 2026.
+    surname = [word for word in _name_words(last) if word not in NAME_SUFFIXES]
+    return surname + _name_words(rest)[:1]
 
 
 def _surname_part_sets(stac_name: str) -> list[list[str]]:

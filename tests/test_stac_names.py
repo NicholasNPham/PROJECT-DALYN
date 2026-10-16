@@ -158,3 +158,49 @@ def test_highlands_check_finds_one_part_of_a_two_part_surname():
 
 def test_highlands_check_still_needs_the_first_name_near_the_surname_part():
     assert not name_in_text(TWO_PART, "SURA filed this. Many lines later the word FIRST appears again here once more")
+
+
+# Initials either way, suffixes optional, conflicts caught. Made-up names only.
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "JOHN A. DOE NOTICE OF PROPOSED ORDER ON MOTION TO CONTINUE",
+        "JOHN A. DOE, JR.",
+        "JOHN ALLEN DOE",
+        "J. ALLEN DOE JR",
+        "J. A. DOE MOTION",
+        "DOE JR, JOHN A",
+        "DOE, JOHN MOTION FOR",
+    ],
+)
+def test_suffix_on_stac_surname_is_not_required(caption: str) -> None:
+    """STAC writes DOE JR; a caption with or without the JR, or with initials, still matches."""
+    assert names_match("DOE JR, JOHN ALLEN", caption)
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "JOHN B. DOE JR",
+        "JOHN BRIAN DOE MOTION",
+        "DOE, JOHN B MOTION",
+        "JOHN A DOE SR",
+    ],
+    ids=["other middle initial", "other middle name", "other initial, surname first", "other suffix"],
+)
+def test_conflicting_middle_name_or_suffix_fails(caption: str) -> None:
+    """Missing is fine, different is not: a different middle or JR against SR is another person."""
+    assert not names_match("DOE JR, JOHN ALLEN", caption)
+
+
+def test_stac_initial_matches_a_whole_name_in_the_caption() -> None:
+    """Initials work the other way too: STAC's J and A against the caption's JOHN ALLEN."""
+    assert names_match("DOE, J A", "JOHN ALLEN DOE MOTION")
+    assert not names_match("DOE, J A", "JOHN BRIAN DOE MOTION")
+
+
+def test_highlands_check_does_not_require_the_suffix() -> None:
+    """The subject and body search drops JR from the required words too."""
+    assert name_in_text("DOE JR, JOHN ALLEN", "SERVICE DOE JOHN A")
