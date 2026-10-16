@@ -709,7 +709,11 @@ def _enter_in_stac(
         logger.error("Email %s: %s", email_number, error)
         return False
     except PartiallyEntered as error:
-        _mark_stac(enterable, StacResult.FAILED, str(error))
+        # Some boxes are already saved. STAC_FAILED reads as "nothing filed,
+        # clear the tag to retry", and a retry would file those boxes twice,
+        # so this gets the tag that says look in STAC first. The reason names
+        # what is already in.
+        _mark_stac(enterable, StacResult.UNKNOWN, str(error))
         logger.error("Email %s: %s", email_number, error)
         return False
     except CaseNotFound as error:
