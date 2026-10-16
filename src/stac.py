@@ -42,6 +42,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from difflib import SequenceMatcher
 
 from selenium.webdriver.support.ui import Select, WebDriverWait
+from urllib3.exceptions import HTTPError as Urllib3Error
 from webdriver_manager.chrome import ChromeDriverManager
 
 from exceptions import DocumentProblem, MessageGone, SystemProblem
@@ -49,9 +50,24 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
+# Every way the browser can fail under a Selenium call. WebDriverException
+# alone misses the connection to chromedriver itself: on 16 Oct 2026 a STAC
+# page that never answered raised urllib3's ReadTimeoutError (from Python's
+# TimeoutError) after 120 seconds, slipped past every handler and stopped
+# the watch. A dead chromedriver raises MaxRetryError or a ConnectionError
+# the same way.
+BROWSER_ERRORS = (WebDriverException, Urllib3Error, TimeoutError, ConnectionError)
+
 # Seconds. Defaults only; config.yaml overrides both.
 DEFAULT_WAIT_TIMEOUT = 10
 DEFAULT_UPLOAD_TIMEOUT = 60
+
+# Seconds a page may take to load. Without a limit Chrome waits forever, and
+# the first thing to give up is Selenium's own 120 second read on chromedriver,
+# which raised a urllib3 error instead of a TimeoutException (16 Oct 2026).
+# Under that, a hung STAC page fails as an ordinary timeout and the pass
+# retries. STAC's slowest normal page, the case search, loads in a few seconds.
+PAGE_LOAD_TIMEOUT = 60
 
 # Attempts per email. The second one gets a fresh browser.
 DEFAULT_MAX_ATTEMPTS = 2
@@ -569,12 +585,19 @@ class StacSession:
         try:
             self.driver.get(self.url)
             self.driver.maximize_window()
-        except WebDriverException as error:
+        except BROWSER_ERRORS as error:
             self.close()
-            raise SystemProblem(f"Could not load STAC at {self.url}: {error}") from error
+            raise SystemProblem(
+                f"Could not load STAC at {self.url}: {type(error).__name__}"
+            ) from error
 
         try:
             self._sign_in()
+        except BROWSER_ERRORS as error:
+            # _sign_in turns its timeouts into SystemProblem. Anything else
+            # the browser raises there is just as much an outage.
+            self.close()
+            raise SystemProblem(f"The browser failed while signing in to STAC: {type(error).__name__}") from error
         except Exception:
             self.close()
             raise
@@ -608,6 +631,7 @@ class StacSession:
             try:
                 service = build_service()
                 driver = webdriver.Chrome(service=service) if service else webdriver.Chrome()
+                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
                 logger.debug("Chrome started via %s", description)
                 return driver
             except Exception as error:  # noqa: BLE001 - each route fails differently
@@ -677,8 +701,10 @@ class StacSession:
             return
         try:
             self.driver.quit()
-        except WebDriverException as error:
-            logger.warning("Chrome did not close cleanly: %s", error)
+        except BROWSER_ERRORS as error:
+            # A hung chromedriver fails here with a urllib3 error, and close
+            # runs inside error handlers that must not be replaced by it.
+            logger.warning("Chrome did not close cleanly: %s", type(error).__name__)
         finally:
             self.driver = None
             self.wait = None
@@ -1780,6 +1806,11 @@ class StacSession:
                 failure that goes straight to a person.
             SystemProblem: If Save could not be pressed at all, in which case
                 nothing was saved and a retry is safe.
+
+        Every browser error is sorted by where it happened, not only
+        timeouts. A crashed or closed Chrome, a stale element, a script error
+        on STAC's page or a hung connection to chromedriver (BROWSER_ERRORS)
+        used to escape here, skip the retry and stop the whole watch.
         """
         upload_wait = WebDriverWait(self.driver, self.upload_timeout)
 
@@ -1797,6 +1828,10 @@ class StacSession:
             raise SystemProblem(
                 f"The Subtype field never showed {subtype} before Save."
             ) from error
+        except BROWSER_ERRORS as error:
+            raise SystemProblem(
+                f"The browser failed while checking the Subtype before Save: {type(error).__name__}"
+            ) from error
 
         # A covered click never reaches the button, so nothing is saved and
         # trying again is safe.
@@ -1805,27 +1840,49 @@ class StacSession:
             upload_wait.until(press)
         except TimeoutException as error:
             raise SystemProblem(f"Could not press Save: {press.blocker}.") from error
+        except BROWSER_ERRORS as error:
+            if not press.clicking:
+                raise SystemProblem(
+                    f"The browser failed before Save was clicked: {type(error).__name__}"
+                ) from error
+            # Chrome failed inside the click itself. Whether STAC got it
+            # cannot be told from here, and a retry could file it twice.
+            raise SaveMayHaveHappened(
+                f"The browser failed while clicking Save for {names} on {ucn} "
+                f"({type(error).__name__}). The document may or may not be on the case. "
+                "Check it by hand; do not re-run this one."
+            ) from error
 
         # Past this line STAC may already have the document.
         try:
             upload_wait.until(
                 EC.presence_of_element_located((By.XPATH, SAVED_NOTIFICATION_XPATH))
             )
-        except TimeoutException as error:
+        except BROWSER_ERRORS as error:
+            # TimeoutException is a WebDriverException, so it lands here too.
+            reason = "STAC never confirmed" if isinstance(error, TimeoutException) else (
+                f"the browser failed before STAC confirmed ({type(error).__name__})"
+            )
             raise SaveMayHaveHappened(
-                f"Pressed Save for {names} on {ucn} but STAC never confirmed. "
+                f"Pressed Save for {names} on {ucn} but {reason}. "
                 "The document may or may not be on the case. Check it by hand; "
                 "do not re-run this one."
             ) from error
 
         # Wait for the notification to clear, or it covers the next document's
-        # Save button.
+        # Save button. The save is confirmed by now, so a failure here must
+        # not undo that: the box counts as filed, and the next box's own
+        # checks catch a browser that is really gone.
         try:
             upload_wait.until(
                 EC.invisibility_of_element_located((By.XPATH, SAVED_NOTIFICATION_XPATH))
             )
         except TimeoutException:
             logger.warning("%s: the saved notification did not clear", ucn)
+        except BROWSER_ERRORS as error:
+            logger.warning(
+                "%s: the browser failed after STAC confirmed the save (%s)", ucn, type(error).__name__
+            )
 
         logger.info("%s: saved %s under %s", ucn, names, self._pair)
 
@@ -2091,9 +2148,14 @@ class PressWhenUncovered:
         """Remember the element to click, for example SAVE_BUTTON_ID."""
         self.element_id = element_id
         self.blocker = "nothing tried yet"
+        # True while click() is running, so a caller that sees some other
+        # browser error knows whether the click may have reached the page.
+        # For Save that is the line between a safe retry and a person.
+        self.clicking = False
 
     def __call__(self, driver: object) -> bool:
         """Try the click once. True once it went through, False to keep waiting."""
+        self.clicking = False
         try:
             element = driver.find_element(By.ID, self.element_id)
             if not element.is_displayed():
@@ -2102,14 +2164,18 @@ class PressWhenUncovered:
             if not element.is_enabled():
                 self.blocker = "the button is disabled"
                 return False
+            self.clicking = True
             element.click()
         except NoSuchElementException:
             self.blocker = "the button is not on the page"
             return False
         except StaleElementReferenceException:
+            # Chrome refused the click on a redrawn button, so it never landed.
+            self.clicking = False
             self.blocker = "the page was redrawing"
             return False
         except ElementClickInterceptedException as error:
+            self.clicking = False
             self.blocker = f"covered by {describe_intercepting_element(error.msg or '')}"
             return False
         return True
@@ -2237,8 +2303,8 @@ class StacRunner:
                 self.session._discard_pending_upload()
                 logger.info("Refreshed the STAC page after the failure, keeping the browser")
                 return
-            except SystemProblem as error:
-                logger.info("Refresh after the failure did not work (%s); restarting", error)
+            except (SystemProblem, *BROWSER_ERRORS) as error:
+                logger.info("Refresh after the failure did not work (%s); restarting", type(error).__name__)
         try:
             self._restart_session()
         except Exception as error:  # noqa: BLE001
@@ -2358,15 +2424,23 @@ class StacRunner:
                     raise PartiallyEntered(f"{self._already_in(entered)} Then: {error}") from error
                 raise
 
-            except SystemProblem as error:
+            except (SystemProblem, *BROWSER_ERRORS) as caught:
+                # A browser error that reaches here came before the current
+                # box's Save, since _save sorts its own. Nothing of that box
+                # is in STAC, so it is retried like any SystemProblem.
+                error = caught if isinstance(caught, SystemProblem) else SystemProblem(
+                    f"The browser failed: {type(caught).__name__}"
+                )
                 if attempt >= self.max_attempts:
                     self._leave_browser_clean()
                     if entered:
                         raise PartiallyEntered(
                             f"{self._already_in(entered)} Then STAC failed and did not "
                             f"recover: {error}"
-                        ) from error
-                    raise
+                        ) from caught
+                    if error is caught:
+                        raise
+                    raise error from caught
 
                 logger.warning(
                     "%s: attempt %s of %s failed (%s). Restarting the browser.",

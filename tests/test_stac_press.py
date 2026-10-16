@@ -7,12 +7,19 @@ way Chrome does while STAC's loading spinner covers it.
 import logging
 
 import pytest
-from selenium.common.exceptions import ElementClickInterceptedException
+from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.exceptions import ReadTimeoutError
 
 from exceptions import SystemProblem
 import stac
-from stac import SAVE_BUTTON_ID, PressWhenUncovered, StacSession, describe_intercepting_element
+from stac import (
+    SAVE_BUTTON_ID,
+    PressWhenUncovered,
+    SaveMayHaveHappened,
+    StacSession,
+    describe_intercepting_element,
+)
 
 
 # Shaped like Chrome's message in the 2026-10-13 dev traceback.
@@ -241,3 +248,78 @@ def test_stuck_spinner_logs_where_it_sits(caplog: pytest.LogCaptureFixture) -> N
 def test_spinner_gone_by_the_time_it_is_described() -> None:
     """Cleared between the timeout and the look: said plainly, not an error."""
     assert _spinner_session(FakeSpinner(shown=0))._describe_spinners() == "none shown any more"
+
+
+class CrashingDriver(FakeDriver):
+    """A driver whose Chrome dies at one chosen step of _save."""
+
+    def __init__(self, button: FakeButton, crash_at: str) -> None:
+        """crash_at is "subtype", "lookup", "click" or "confirm"."""
+        super().__init__(button, subtype="ORDERS")
+        self.crash_at = crash_at
+
+    def find_element(self, by: str, value: str) -> FakeButton:
+        """The button by id, and the saved notification by xpath once clicked."""
+        if self.crash_at == "lookup" or (self.crash_at == "confirm" and by == "xpath"):
+            raise WebDriverException("chrome not reachable")
+        return self.button
+
+    def execute_script(self, script: str) -> str:
+        """The Kendo subtype read, or a script error in its place."""
+        if self.crash_at == "subtype":
+            raise WebDriverException("javascript error")
+        return self.subtype
+
+
+def _crashing_session(crash_at: str) -> StacSession:
+    """A session whose browser fails at `crash_at`."""
+    button = FakeButton(covered=0)
+    if crash_at == "click":
+        def click() -> None:
+            """Chrome dies inside the click call."""
+            raise WebDriverException("chrome not reachable")
+        button.click = click
+    session = StacSession.__new__(StacSession)
+    session.driver = CrashingDriver(button, crash_at)
+    session.upload_timeout = 0.1
+    return session
+
+
+@pytest.mark.parametrize("crash_at", ["subtype", "lookup"])
+def test_browser_error_before_the_click_is_a_safe_retry(crash_at: str) -> None:
+    """Nothing reached Save, so it is a plain SystemProblem and can be retried."""
+    with pytest.raises(SystemProblem) as raised:
+        _crashing_session(crash_at)._save("UCN", "ORDERS", "document.pdf")
+
+    assert type(raised.value) is SystemProblem
+
+
+@pytest.mark.parametrize("crash_at", ["click", "confirm"])
+def test_browser_error_from_the_click_on_may_have_saved(crash_at: str) -> None:
+    """The click may have reached STAC, so a person checks before anything is redone."""
+    with pytest.raises(SaveMayHaveHappened, match="may or may not be on the case"):
+        _crashing_session(crash_at)._save("UCN", "ORDERS", "document.pdf")
+
+
+def test_hung_connection_inside_the_click_may_have_saved() -> None:
+    """The live 16 Oct hang was urllib3's ReadTimeoutError, not a Selenium error."""
+    session = _crashing_session("confirm")
+
+    def click() -> None:
+        """chromedriver stops answering mid-click."""
+        raise ReadTimeoutError(None, "/session", "Read timed out.")
+
+    session.driver.button.click = click
+    session.driver.crash_at = "none"
+
+    with pytest.raises(SaveMayHaveHappened, match="ReadTimeoutError"):
+        session._save("UCN", "ORDERS", "document.pdf")
+
+
+def test_browser_error_message_names_no_page_text() -> None:
+    """Only the error's type reaches the message, never Selenium's own text."""
+    with pytest.raises(SaveMayHaveHappened) as raised:
+        _crashing_session("click")._save("UCN", "ORDERS", "document.pdf")
+
+    assert "WebDriverException" in str(raised.value)
+    assert "chrome not reachable" not in str(raised.value)
