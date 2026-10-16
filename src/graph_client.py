@@ -45,6 +45,11 @@ MAX_PAGES = 200
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 300
 
+# Tries for a new token when the connection to Microsoft's sign-in service
+# drops. Waits 2s then 4s between them: a renewal is quick, and a pass that
+# still cannot get one is better failed and retried by --watch.
+TOKEN_RETRIES = 3
+
 # Always retried: Microsoft is throttling or briefly down, and nothing was done.
 RETRY_ANY_METHOD = frozenset({429, 503})
 
@@ -111,8 +116,34 @@ class GraphClient:
 
         Raises:
             GraphAuthError: If Microsoft refuses to issue a token.
+            SystemProblem: If Microsoft cannot be reached for a new token
+                after TOKEN_RETRIES tries. The pass fails and --watch tries
+                again, rather than stopping as it would on a refused credential.
         """
-        result = self._msal_app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+        for attempt in range(TOKEN_RETRIES):
+            try:
+                result = self._msal_app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+                break
+            except (requests.ConnectionError, requests.Timeout) as error:
+                # MSAL renews the token about once an hour, over its own
+                # connection to the sign-in service. A drop then escaped as a
+                # raw requests error, outside _request's retry, and stopped
+                # --watch: the gap 5c36f37 left. Asking for a token changes
+                # nothing, so it is always safe to ask again.
+                if attempt == TOKEN_RETRIES - 1:
+                    raise SystemProblem(
+                        f"Could not reach Microsoft for a Graph token ({type(error).__name__}) "
+                        f"after {TOKEN_RETRIES} tries."
+                    ) from error
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Token request lost its connection (%s), waiting %ss (attempt %s of %s)",
+                    type(error).__name__,
+                    wait,
+                    attempt + 1,
+                    TOKEN_RETRIES,
+                )
+                time.sleep(wait)
 
         if "access_token" in result:
             return result["access_token"]
