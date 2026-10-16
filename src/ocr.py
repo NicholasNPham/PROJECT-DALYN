@@ -121,6 +121,15 @@ UNDERLINE_THICKEN = 3
 # memorandum cost 41 seconds and still matched nothing.
 FORCE_OCR_PAGE_LIMIT = 3
 
+# The first OCR of a scan reads more than the retry does, because a rule that
+# is not title-only can match anywhere and the defendant check wants the
+# caption. But not the whole thing: on the first live morning (13 Oct 2026)
+# five scans of 193 to 244 pages took about five minutes each and held one
+# mailbox up for 34 minutes, and on 14 Oct one email took 23. Ten pages is
+# about a minute at worst, and the title, caption and case number of every
+# filing seen so far sit on page one or two.
+OCR_PAGE_LIMIT = 10
+
 logger = get_logger(__name__)
 
 
@@ -188,12 +197,13 @@ def extract_text(pdf_bytes: bytes, filename: str, force_ocr: bool = False) -> tu
         return text, "embedded"
 
     logger.info(
-        "%s: embedded text unusable (%s chars from %s pages), running OCR",
+        "%s: embedded text unusable (%s chars from %s pages), running OCR on up to %s pages",
         filename,
         len(text),
         page_count,
+        OCR_PAGE_LIMIT,
     )
-    return _ocr(pdf_bytes, filename), "ocr"
+    return _ocr(pdf_bytes, filename, page_limit=OCR_PAGE_LIMIT), "ocr"
 
 
 def ocr_without_cleanup(pdf_bytes: bytes, filename: str) -> str:
@@ -340,7 +350,8 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None, strip_r
         pdf_bytes: Raw PDF file content.
         filename: Attachment name, for logging and error messages.
         page_limit: Stop after this many pages. None reads the whole document.
-            Used by the forced retry, which is only ever looking for a heading.
+            Every caller passes one: OCR_PAGE_LIMIT for a first read,
+            FORCE_OCR_PAGE_LIMIT for the retries, which only look for a heading.
         strip_rules: Paint out underlines before OCR. Off only for
             ocr_without_cleanup.
 
@@ -359,6 +370,7 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None, strip_r
         ) from error
 
     pages = []
+    page_count = document.page_count
 
     with document:
         for number, page in enumerate(document, start=1):
@@ -390,7 +402,13 @@ def _ocr(pdf_bytes: bytes, filename: str, page_limit: int | None = None, strip_r
             f"{filename}: OCR produced no text from {len(pages)} pages"
         )
 
-    logger.info("%s: %s chars from %s pages via OCR", filename, len(text), len(pages))
+    if page_limit is not None and page_count > page_limit:
+        logger.info(
+            "%s: %s chars from the first %s of %s pages via OCR",
+            filename, len(text), len(pages), page_count,
+        )
+    else:
+        logger.info("%s: %s chars from %s pages via OCR", filename, len(text), len(pages))
     return text
 
 
