@@ -124,3 +124,65 @@ def test_sign_in_page_that_hangs_is_a_system_problem() -> None:
 
     assert driver.quit_called
     assert session.driver is None
+
+
+class CountingSession:
+    """Stands in for StacSession: counts sign-ins, and fails the first `fail` of them."""
+
+    opened = 0
+    fail = 0
+
+    def __init__(self, config: dict) -> None:
+        """Nothing to read."""
+
+    def open(self) -> None:
+        """Count the sign-in, failing while `fail` lasts."""
+        CountingSession.opened += 1
+        if CountingSession.opened <= CountingSession.fail:
+            raise SystemProblem("Could not load STAC: TimeoutException")
+
+    def close(self) -> None:
+        """Nothing to close."""
+
+
+def _lazy_runner(monkeypatch: pytest.MonkeyPatch, fail: int = 0) -> StacRunner:
+    """A runner whose sessions are CountingSession."""
+    import stac
+
+    CountingSession.opened = 0
+    CountingSession.fail = fail
+    monkeypatch.setattr(stac, "StacSession", CountingSession)
+    runner = StacRunner.__new__(StacRunner)
+    runner._config = {}
+    runner.session = None
+    return runner
+
+
+def test_entering_the_runner_signs_in_to_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty pass never opens Chrome."""
+    with _lazy_runner(monkeypatch):
+        pass
+
+    assert CountingSession.opened == 0
+
+
+def test_open_signs_in_once_however_often_it_is_called(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Called per mailbox with mail, it still signs in once a pass."""
+    with _lazy_runner(monkeypatch) as runner:
+        runner.open()
+        runner.open()
+
+    assert CountingSession.opened == 1
+
+
+def test_failed_sign_in_is_tried_again_by_the_next_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed sign-in leaves no session behind to be mistaken for a working one."""
+    runner = _lazy_runner(monkeypatch, fail=1)
+
+    with pytest.raises(SystemProblem):
+        runner.open()
+    assert runner.session is None
+
+    runner.open()
+    assert CountingSession.opened == 2
+    assert runner.session is not None

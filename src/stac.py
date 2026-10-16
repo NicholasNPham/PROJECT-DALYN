@@ -2383,6 +2383,10 @@ class StacRunner:
     Used as `with StacRunner(config) as runner:`. Chrome opens once, not once
     per email: fifty sign-ins for one batch would be slow and would fill
     STAC's audit log with noise.
+
+    Entering the `with` opens nothing. The caller calls open() once there is
+    mail to file, so a pass with an empty Inbox never signs in. On 16 Oct
+    2026 such a pass hung on STAC's sign-in page with nothing to do.
     """
 
     def __init__(self, config: dict) -> None:
@@ -2400,8 +2404,17 @@ class StacRunner:
         self.session: StacSession | None = None
 
     def __enter__(self) -> "StacRunner":
-        self._start_session()
         return self
+
+    def open(self) -> None:
+        """Start Chrome and sign in, unless that is already done. Safe to call often.
+
+        Raises:
+            SystemProblem: If Chrome will not start, STAC will not load, or the
+                sign-in fails, as StacSession.open.
+        """
+        if self.session is None:
+            self._start_session()
 
     def __exit__(self, *_) -> None:
         if self.session:
@@ -2409,8 +2422,15 @@ class StacRunner:
             self.session = None
 
     def _start_session(self) -> None:
-        self.session = StacSession(self._config)
-        self.session.open()
+        """Open a new signed-in session, kept only once the sign-in worked.
+
+        A failed sign-in leaves self.session as None, so a later open() tries
+        again rather than taking a closed browser for a working one.
+        """
+        self.session = None
+        session = StacSession(self._config)
+        session.open()
+        self.session = session
 
     def _restart_session(self) -> None:
         """Throw the browser away and sign in again.
@@ -2487,6 +2507,9 @@ class StacRunner:
             SystemProblem: STAC is broken and the retries are used up. The
                 pass should stop.
         """
+        # Normally open already. Not after a restart that failed in
+        # _leave_browser_clean, which leaves no session for the next email.
+        self.open()
         groups = group_by_type(documents)
         entered: list = []
 

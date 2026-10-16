@@ -886,10 +886,8 @@ def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> i
     email_number = 0
 
     try:
-        # One browser for the whole pass, all mailboxes. Opened before the
-        # first message so a bad password or an unreachable STAC stops the run
-        # immediately rather than after fifty documents have been OCR'd for
-        # nothing.
+        # One browser for the whole pass, all mailboxes, opened by the first
+        # mailbox that lists any mail. See runner.open() below.
         with StacRunner(config) as runner:
             for mailbox in config["enabled_mailboxes"]:
                 messages = client.list_messages(
@@ -924,6 +922,14 @@ def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> i
                 source_folder_id = client.get_folder_id(mailbox, config["source_folder"])
                 logger.info("%s: %s message(s) with attachments", mailbox, len(messages))
                 listed_by_mailbox[mailbox] = len(messages)
+
+                # Signed in only once there is mail, so an empty pass never
+                # touches STAC: on 16 Oct 2026 one hung at the sign-in page
+                # with nothing to do. Still before any tag or download, so a
+                # bad password or an unreachable STAC stops the pass before
+                # any email is touched. Signs in once a pass, not per mailbox.
+                if messages:
+                    runner.open()
 
                 # Looked up before the first email, so a missing done folder
                 # stops the pass before any work is done.
