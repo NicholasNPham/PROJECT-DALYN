@@ -204,3 +204,50 @@ def test_stac_initial_matches_a_whole_name_in_the_caption() -> None:
 def test_highlands_check_does_not_require_the_suffix() -> None:
     """The subject and body search drops JR from the required words too."""
     assert name_in_text("DOE JR, JOHN ALLEN", "SERVICE DOE JOHN A")
+
+
+# Highlands and Hardee read names the way the Polk caption check does.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "STATE OF FLORIDA VS J. DOE - Notice",
+        "STATE VS DOE, J - Notice",
+        "STATE OF FLORIDA V. JOHN A. DOE, Defendant",
+    ],
+)
+def test_highlands_check_accepts_an_initial_for_the_first_name(text: str) -> None:
+    """J DOE finds STAC's DOE, JOHN ALLEN, as it already did for Polk."""
+    assert name_in_text("DOE, JOHN ALLEN", text)
+
+
+def test_highlands_check_finds_a_stac_name_with_only_an_initial() -> None:
+    """STAC's DOE, J used to come down to DOE alone and could never be found."""
+    assert name_in_text("DOE, J", "STATE OF FLORIDA VS JOHN DOE - Notice")
+    assert not name_in_text("DOE, J", "STATE OF FLORIDA VS MARK DOE - Notice")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "STATE OF FLORIDA VS JOHN B. DOE - Notice",
+        "STATE VS DOE, JOHN B - Notice",
+        "STATE OF FLORIDA VS JOHN A DOE SR - Notice",
+    ],
+    ids=["other middle initial", "other initial, surname first", "other suffix"],
+)
+def test_highlands_check_fails_a_conflicting_middle_name_or_suffix(text: str) -> None:
+    """Missing is fine, different is not, the same as Polk."""
+    assert not name_in_text("DOE JR, JOHN ALLEN", text)
+
+
+def test_highlands_check_still_passes_without_middle_name_or_suffix() -> None:
+    """Leaving out the middle name and the JR is not a conflict."""
+    assert name_in_text("DOE JR, JOHN ALLEN", "STATE OF FLORIDA VS JOHN DOE - Notice")
+
+
+def test_highlands_check_keeps_its_stricter_bar() -> None:
+    """THORNPSON for THOMPSON (0.82) passes the Polk caption check but not the 90% bar."""
+    assert names_match("THOMPSON, JOHN", "JOHN THORNPSON")
+    assert not name_in_text("THOMPSON, JOHN", "STATE OF FLORIDA VS JOHN THORNPSON")

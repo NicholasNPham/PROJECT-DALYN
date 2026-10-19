@@ -21,7 +21,7 @@ log.
 
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -2024,21 +2024,44 @@ def _laid_out_name_match(stac_name: str, document_name: str) -> bool | None:
     stac = _parse_stac_name(stac_name)
     if stac is None:
         return None
+    return next(_laid_out_verdicts(stac, _caption_words(document_name)), None)
+
+
+def _laid_out_verdicts(
+    stac: tuple[list[str], str | None, str, list[str]],
+    words: list[str],
+    similarity: float = NAME_TOKEN_SIMILARITY,
+) -> Iterator[bool]:
+    """Judge every place in words where STAC's name is laid out as a name.
+
+    Yields one verdict per surname found with the first name next to it, in
+    order: True when the middle names and suffix agree with STAC, False when
+    one conflicts. The caption check takes the first, and name_in_text weighs
+    them all.
+
+    Args:
+        stac: STAC's name as _parse_stac_name splits it.
+        words: The text as _caption_words splits it.
+        similarity: How alike the surname and first name must be.
+    """
     surname, suffix, first, middles = stac
-    words = _caption_words(document_name)
 
     for start in range(len(words)):
-        if not _surname_at(surname, words, start):
+        if not _surname_at(surname, words, start, similarity):
             continue
         end = start + len(surname) - 1
 
         # FIRST [MIDDLE ...] SURNAME [SUFFIX]. One spare word between, for a
         # second middle name STAC does not have.
-        for at in range(max(0, start - len(middles) - 2), start):
-            if _given_alike(first, words[at]):
-                between = [w for w in words[at + 1:start] if w not in NAME_SUFFIXES]
-                after = words[end + 1:end + 2]
-                return _middles_agree(middles, between) and _suffixes_agree(suffix, after)
+        at = next(
+            (at for at in range(max(0, start - len(middles) - 2), start) if _given_alike(first, words[at], similarity)),
+            None,
+        )
+        if at is not None:
+            between = [w for w in words[at + 1:start] if w not in NAME_SUFFIXES]
+            after = words[end + 1:end + 2]
+            yield _middles_agree(middles, between) and _suffixes_agree(suffix, after)
+            continue
 
         # SURNAME [SUFFIX], FIRST [MIDDLE ...]. Only initials, or words close
         # to STAC's middle names, are judged after the first name: a whole
@@ -2046,7 +2069,7 @@ def _laid_out_name_match(stac_name: str, document_name: str) -> bool | None:
         # conflicting middle name.
         after_surname = words[end + 1:]
         offset = 1 if after_surname[:1] and after_surname[0] in NAME_SUFFIXES else 0
-        if len(after_surname) > offset and _given_alike(first, after_surname[offset]):
+        if len(after_surname) > offset and _given_alike(first, after_surname[offset], similarity):
             rest = after_surname[offset + 1:]
             trailing = []
             for word in rest[:len(middles)]:
@@ -2057,9 +2080,7 @@ def _laid_out_name_match(stac_name: str, document_name: str) -> bool | None:
                 else:
                     break
             suffix_words = after_surname[:offset] or rest[len(trailing):len(trailing) + 1]
-            return _middles_agree(middles, trailing) and _suffixes_agree(suffix, suffix_words)
-
-    return None
+            yield _middles_agree(middles, trailing) and _suffixes_agree(suffix, suffix_words)
 
 
 def _parse_stac_name(stac_name: str) -> tuple[list[str], str | None, str, list[str]] | None:
@@ -2092,21 +2113,23 @@ def _caption_words(text: str) -> list[str]:
     ]
 
 
-def _surname_at(surname: list[str], words: list[str], start: int) -> bool:
+def _surname_at(
+    surname: list[str], words: list[str], start: int, similarity: float = NAME_TOKEN_SIMILARITY
+) -> bool:
     """True when every surname word sits at words[start:], in order, near enough."""
     if len(words) - start < len(surname):
         return False
     return all(
-        len(want) > 1 and SequenceMatcher(None, want, got).ratio() >= NAME_TOKEN_SIMILARITY
+        len(want) > 1 and _words_alike(want, got, similarity)
         for want, got in zip(surname, words[start:])
     )
 
 
-def _given_alike(want: str, got: str) -> bool:
+def _given_alike(want: str, got: str, similarity: float = NAME_TOKEN_SIMILARITY) -> bool:
     """True when two given names agree: near the same, or an initial of the other."""
     if len(want) == 1 or len(got) == 1:
         return want[0] == got[0]
-    return SequenceMatcher(None, want, got).ratio() >= NAME_TOKEN_SIMILARITY
+    return _words_alike(want, got, similarity)
 
 
 def _middles_agree(middles: list[str], found: list[str]) -> bool:
@@ -2139,14 +2162,26 @@ def _every_word_has_a_near_match(fewer: set, more: set) -> bool:
 def name_in_text(stac_name: str, text: str) -> bool:
     """True when STAC's defendant is named close together somewhere in text.
 
-    Every required word of STAC's name must have a word in the text at least
-    REQUIRED_NAME_SIMILARITY alike, all within a few words of each other, in
-    any order. So JOHN A SMITH, SMITH JOHN and STATE VS SMITH, JOHN ALLEN all
-    find SMITH, JOHN A, but a SMITH in one sentence and a JOHN three lines on
-    do not.
+    First the same laid-out reading as the Polk caption check, at Highlands
+    and Hardee's stricter REQUIRED_NAME_SIMILARITY: an initial counts for a
+    whole first or middle name either way, and a conflicting middle name or
+    suffix anywhere in the text fails it. Before 19 Oct 2026 J SMITH never
+    found SMITH, JOHN here although Polk accepted it, and STAC's SMITH, J
+    could not be found at all.
+
+    When the name is nowhere laid out that way, every required word of
+    STAC's name must have a word in the text at least that alike, all within
+    a few words of each other, in any order. So SMITH JOHN and STATE VS
+    SMITH, JOHN ALLEN find SMITH, JOHN A, but a SMITH in one sentence and a
+    JOHN three lines on do not.
     """
     if not text:
         return False
+    stac = _parse_stac_name(stac_name)
+    if stac is not None:
+        verdicts = list(_laid_out_verdicts(stac, _caption_words(text), REQUIRED_NAME_SIMILARITY))
+        if verdicts:
+            return all(verdicts)
     words = re.findall(r"[A-Z]+", text.upper())
     return any(
         _named_together(required, words)
@@ -2220,16 +2255,16 @@ def _name_words(name: str) -> list[str]:
     ]
 
 
-def _words_alike(wanted: str, word: str) -> bool:
-    """True when two words are the same or REQUIRED_NAME_SIMILARITY alike."""
+def _words_alike(wanted: str, word: str, similarity: float = REQUIRED_NAME_SIMILARITY) -> bool:
+    """True when two words are the same or at least similarity alike."""
     if wanted == word:
         return True
     matcher = SequenceMatcher(None, wanted, word)
     # Cheap upper bounds first: a long document is tens of thousands of words.
     return (
-        matcher.real_quick_ratio() >= REQUIRED_NAME_SIMILARITY
-        and matcher.quick_ratio() >= REQUIRED_NAME_SIMILARITY
-        and matcher.ratio() >= REQUIRED_NAME_SIMILARITY
+        matcher.real_quick_ratio() >= similarity
+        and matcher.quick_ratio() >= similarity
+        and matcher.ratio() >= similarity
     )
 
 
