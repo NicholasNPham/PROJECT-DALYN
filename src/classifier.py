@@ -80,7 +80,24 @@ TITLE_ONLY_PHRASES = frozenset({"order", "motion", "judgment", "memorandum of la
 # starts-with exists to avoid. A defense notice of participation at
 # depositions in the 14 Oct 2026 test batch put the defendant's name first,
 # "defendant <name> notice of participation", so no phrase could start it.
+#
+# The sheet can ask for the same on any row by starting the phrase with a *,
+# as in * MOTION TO WITHDRAW. Added 16 Oct 2026 after two defense filings
+# matched nothing: "notice of calendar conflict and unopposed motion to
+# continue", and a motion to withdraw headed with the law firm's name.
 TITLE_CONTAINS_PHRASES = frozenset({"notice of participation"})
+ANYWHERE_IN_TITLE = "*"
+
+# Words that, before a mid-line phrase, mean the document is about that
+# filing rather than the filing itself: "order granting defendant s motion to
+# continue" is an order, "notice of hearing on motion to continue" a notice of
+# hearing, "state s response to motion to continue" a response. Any of them
+# earlier in the line stops the mid-line match, and the rest of the sheet
+# decides. A line that starts with the phrase is unaffected.
+TITLE_CONTAINS_BLOCKERS = frozenset({
+    "order", "granting", "denying", "hearing", "response", "objection",
+    "opposition", "reply", "withdrawal", "withdraw",
+})
 
 # A * in a phrase stands in for the defendant's name, which defense titles
 # put in the middle: "defendant <name> s witness list" in the 14 Oct 2026
@@ -198,8 +215,14 @@ def load_rules(excel_path: Path) -> list[Rule]:
                 )
                 continue
 
+            # A leading * and no other: the phrase may come after anything in a
+            # title line, such as a law firm's name of any length. normalize
+            # has already turned the * into a space.
+            anywhere = str(phrase).strip().startswith(ANYWHERE_IN_TITLE) and str(phrase).count("*") == 1
+            seen_key = f"{ANYWHERE_IN_TITLE} {normalized}" if anywhere else normalized
+
             name_gap = None
-            if NAME_GAP in str(phrase):
+            if NAME_GAP in str(phrase) and not anywhere:
                 name_gap = _name_gap_pattern(str(phrase))
                 if name_gap is None:
                     logger.warning(
@@ -211,17 +234,18 @@ def load_rules(excel_path: Path) -> list[Rule]:
                 # Kept with the * so it never equals, or is taken for a
                 # duplicate of, the same words written without a gap.
                 normalized = f" {NAME_GAP} ".join(normalize(part) for part in str(phrase).split(NAME_GAP))
+                seen_key = normalized
 
-            if normalized in seen:
+            if seen_key in seen:
                 logger.warning(
                     "Rules row %s repeats the phrase from row %s (%r). "
                     "The later row can never match and is ignored.",
                     row_number,
-                    seen[normalized],
+                    seen[seen_key],
                     phrase,
                 )
                 continue
-            seen[normalized] = row_number
+            seen[seen_key] = row_number
 
             fuzzy = _cell(row, COL_FUZZY) == "YES"
             compressed = normalized.replace(" ", "")
@@ -236,9 +260,9 @@ def load_rules(excel_path: Path) -> list[Rule]:
                 )
                 fuzzy = False
 
-            if fuzzy and name_gap:
-                # Fuzzy compares a fixed run of characters, which a name of
-                # any length breaks.
+            if fuzzy and (name_gap or anywhere):
+                # Fuzzy compares a fixed run of characters from the start of
+                # a line, which a name of any length breaks.
                 logger.warning(
                     "Rules row %s (%r) has a * and is marked Fuzzy. It will be matched exactly only.",
                     row_number,
@@ -269,9 +293,10 @@ def load_rules(excel_path: Path) -> list[Rule]:
                         normalized in TITLE_ONLY_PHRASES
                         or normalized in TITLE_CONTAINS_PHRASES
                         or name_gap is not None
+                        or anywhere
                     ),
                     row=row_number,
-                    title_contains=normalized in TITLE_CONTAINS_PHRASES,
+                    title_contains=anywhere or normalized in TITLE_CONTAINS_PHRASES,
                     name_gap=name_gap,
                 )
             )
@@ -361,13 +386,23 @@ def _match_exact(
         for line in title_lines if rule.title_only else lines:
             if line.startswith(rule.normalized):
                 return _result(rule, line, 1.0)
-            # Padded so "notice of participation" cannot match inside a
-            # longer word on either side.
-            if rule.title_contains and f" {rule.normalized} " in f" {line} ":
+            if rule.title_contains and _contains_as_title(rule.normalized, line):
                 return _result(rule, line, 1.0)
             if rule.name_gap and rule.name_gap.match(line):
                 return _result(rule, line, 1.0)
     return None
+
+
+def _contains_as_title(phrase: str, line: str) -> bool:
+    """True when phrase sits in line on whole words, with no blocker before it.
+
+    Padded so "notice of participation" cannot match inside a longer word on
+    either side. Only the first place it occurs is judged: a later one has
+    the same words before it and more.
+    """
+    padded = f" {line} "
+    start = padded.find(f" {phrase} ")
+    return start != -1 and not TITLE_CONTAINS_BLOCKERS & set(padded[:start].split())
 
 
 def _name_gap_pattern(phrase: str) -> re.Pattern | None:

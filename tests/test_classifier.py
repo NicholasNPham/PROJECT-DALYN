@@ -1,3 +1,8 @@
+from pathlib import Path
+
+import pytest
+from openpyxl import Workbook
+
 from classifier import (
     TITLE_CONTAINS_PHRASES,
     TITLE_ONLY_PHRASES,
@@ -6,6 +11,7 @@ from classifier import (
     _name_gap_pattern,
     classify,
     compress,
+    load_rules,
     normalize,
 )
 from models import ClassificationResult
@@ -84,6 +90,91 @@ def test_notice_of_participation_needs_whole_words() -> None:
     rules = [_rule("NOTICE OF PARTICIPATION", "DISCOVERY", "DEPOSITION", 2)]
 
     assert classify(rules, "DEFENDANT NOTICE OF PARTICIPATIONS") == ClassificationResult()
+
+
+def _sheet_rules(tmp_path: Path, *rows: tuple) -> list[Rule]:
+    """Load made-up rows through load_rules: (phrase, type, subtype[, fuzzy])."""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Rules"
+    sheet.append(["Order", "Phrase", "TYPE", "SUBTYPE", "Fuzzy?"])
+    for number, (phrase, document_type, subtype, *fuzzy) in enumerate(rows, start=1):
+        sheet.append([number, phrase, document_type, subtype, fuzzy[0] if fuzzy else None])
+    path = tmp_path / "rules.xlsx"
+    workbook.save(path)
+    return load_rules(path)
+
+
+@pytest.mark.parametrize("phrase", ["* MOTION TO CONTINUE", "* UNOPPOSED MOTION TO CONTINUE"])
+@pytest.mark.parametrize(
+    "title",
+    [
+        "NOTICE OF CALENDAR CONFLICT AND UNOPPOSED MOTION TO CONTINUE",
+        "NOTICE OF UNAVAILABILITY AND UNOPPOSED MOTION TO CONTINUE",
+        "UNOPPOSED MOTION TO CONTINUE",
+    ],
+)
+def test_leading_star_matches_after_anything_in_the_title(tmp_path: Path, phrase: str, title: str) -> None:
+    """A * row matches its phrase after a notice of something else, written either way."""
+    rules = _sheet_rules(tmp_path, (phrase, "COURT", "MOTIONS"))
+
+    assert classify(rules, f"STATE OF FLORIDA\n{title}").rule_row == 2
+
+
+def test_leading_star_matches_after_a_law_firm_name(tmp_path: Path) -> None:
+    """A firm's name of any length before the phrase, longer than a name gap allows."""
+    rules = _sheet_rules(tmp_path, ("* MOTION TO WITHDRAW", "COURT", "MOTIONS"))
+    title = "THE DOE AND ROE LAW FIRM S MOTION TO WITHDRAW AS ATTORNEY"
+
+    assert classify(rules, f"STATE OF FLORIDA\n{title}").rule_row == 2
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "ORDER GRANTING DEFENDANT'S UNOPPOSED MOTION TO CONTINUE",
+        "ORDER ON MOTION TO CONTINUE",
+        "NOTICE OF HEARING ON MOTION TO CONTINUE",
+        "STATE'S RESPONSE TO MOTION TO CONTINUE",
+    ],
+)
+def test_filing_about_the_motion_is_not_the_motion(tmp_path: Path, title: str) -> None:
+    """An order, hearing notice or response names the motion mid-line but is not one."""
+    rules = _sheet_rules(tmp_path, ("* MOTION TO CONTINUE", "COURT", "MOTIONS"))
+
+    assert classify(rules, f"STATE OF FLORIDA\n{title}") == ClassificationResult()
+
+
+def test_leading_star_looks_only_in_the_title_region(tmp_path: Path) -> None:
+    """A mention deep in the body is not a title."""
+    rules = _sheet_rules(tmp_path, ("* MOTION TO WITHDRAW", "COURT", "MOTIONS"))
+    body = "\n".join(["filler line"] * TITLE_REGION_LINES + ["counsel filed a motion to withdraw"])
+
+    assert classify(rules, body) == ClassificationResult()
+
+
+def test_longer_star_row_above_wins(tmp_path: Path) -> None:
+    """MOTION TO WITHDRAW PLEA above MOTION TO WITHDRAW keeps a plea motion apart."""
+    rules = _sheet_rules(
+        tmp_path,
+        ("* MOTION TO WITHDRAW PLEA", "COURT", "PLEA"),
+        ("* MOTION TO WITHDRAW", "COURT", "MOTIONS"),
+    )
+
+    assert classify(rules, "STATE OF FLORIDA\nDEFENDANT S MOTION TO WITHDRAW PLEA").rule_row == 2
+    assert classify(rules, "STATE OF FLORIDA\nTHE FIRM S MOTION TO WITHDRAW AS COUNSEL").rule_row == 3
+
+
+def test_leading_star_row_is_exact_only_and_kept_apart_from_the_plain_row(tmp_path: Path) -> None:
+    """Fuzzy is switched off, and * X does not count as a repeat of a plain X row."""
+    rules = _sheet_rules(
+        tmp_path,
+        ("MOTION TO CONTINUE", "COURT", "MOTIONS"),
+        ("* MOTION TO CONTINUE", "COURT", "MOTIONS", "YES"),
+    )
+
+    assert [rule.row for rule in rules] == [2, 3]
+    assert rules[1].title_contains and not rules[1].fuzzy
 
 
 def _gap_rule(phrase: str, row: int = 2) -> Rule:
