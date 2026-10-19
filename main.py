@@ -813,8 +813,8 @@ def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> i
 
     Args:
         config: From load_config.
-        limit: Tighten max_messages_per_mailbox for this pass. Per mailbox
-            too, so --limit 1 is one email from each enabled mailbox.
+        limit: Tighten every mailbox's batch size for this pass, so --limit 1
+            is one email from each enabled mailbox.
         recheck: Also take every email tagged Waiting for STAC, after the
             batch and outside it, and search STAC for its case again. Not
             capped: these are few, since each leaves after
@@ -849,19 +849,20 @@ def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> i
 
     # Per mailbox, not shared. A shared budget was worked in list order, so a
     # busy first mailbox used all of it and the others went unread for as
-    # long as it stayed busy. --limit tightens the same number rather than
-    # introducing a second one.
-    batch_size = config["max_messages_per_mailbox"]
-    if limit is not None:
-        batch_size = min(batch_size, limit)
+    # long as it stayed busy. Each mailbox has its own batch_size, or
+    # max_messages_per_mailbox. --limit tightens every one of them rather than
+    # introducing a second number.
+    batch_sizes = {
+        mailbox: size if limit is None else min(size, limit)
+        for mailbox, size in config["batch_sizes"].items()
+    }
 
     order = "newest first" if config["newest_first"] else "oldest first"
     logger.info(
-        "Pass: up to %s message(s) from %s of each of %s, %s",
-        batch_size,
+        "Pass: from %s, %s, up to %s",
         config["source_folder"],
-        ", ".join(config["enabled_mailboxes"]),
         order,
+        ", ".join(f"{size} from {mailbox}" for mailbox, size in batch_sizes.items()),
     )
 
     work_dir = config["paths"]["temp"] / f"stac_{stamp}"
@@ -894,7 +895,7 @@ def run_pass(config: dict, limit: int | None = None, recheck: bool = False) -> i
                     mailbox,
                     days_back=config["days_back"],
                     folder=config["source_folder"],
-                    max_messages=batch_size,
+                    max_messages=batch_sizes[mailbox],
                     newest_first=config["newest_first"],
                     # Skipped in the listing rather than here, so handled
                     # mail does not use up the batch. needs_handling lets

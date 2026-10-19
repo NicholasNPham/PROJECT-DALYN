@@ -22,11 +22,16 @@ rbac_control_mailbox: ""
 # enforced in graph_client.py. A disabled mailbox is not reachable at all, not
 # merely skipped, so this is where a mailbox is genuinely held back until its
 # access is approved. Enable one at a time.
+#
+# batch_size is optional: the most emails one pass takes from that mailbox.
+# Left out, max_messages_per_mailbox below applies. Use it for a mailbox much
+# busier or quieter than the rest. --limit still lowers every mailbox.
 mailboxes:
   - address: "mailbox1@example.com"
     enabled: false
   - address: "mailbox2@example.com"
     enabled: true
+    batch_size: 20
   - address: "mailbox3@example.com"
     enabled: false
   - address: "mailbox4@example.com"
@@ -102,7 +107,8 @@ days_back: 2
 # Most emails one pass takes from EACH enabled mailbox, so three mailboxes
 # at 10 is up to 30 a pass. Per mailbox so a busy one cannot leave the others
 # unread. This is also the batch tagged Queued up front, so keep it small
-# while staff share the folder. Live: 10. --limit lowers it for one run.
+# while staff share the folder. Live: 10. --limit lowers it for one run. A
+# mailbox's own batch_size, above, takes its place for that mailbox.
 # Formerly max_messages, a total for all mailboxes; that name is refused.
 max_messages_per_mailbox: 10
 

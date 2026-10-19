@@ -60,6 +60,10 @@ RETIRED_KEYS = {
 }
 PATH_KEYS = ("logs", "temp", "excel", "stac_types")
 MAILBOX_KEYS = ("address", "enabled")
+# Optional on a mailbox entry: its own batch size, for a mailbox busier or
+# quieter than the rest. Left out, max_messages_per_mailbox applies, which is
+# itself required, so there is still no default anywhere.
+MAILBOX_OPTIONAL_KEYS = ("batch_size",)
 # What DALYN may do to a message once it has handled it. All three are
 # required, with no defaults, because each one writes to a real mailbox.
 MAILBOX_ACTION_KEYS = ("tag_enabled", "move_enabled", "skip_tagged")
@@ -188,12 +192,14 @@ def _validate(config: dict, path: Path) -> None:
             f"Config at {path} has empty graph settings: {', '.join(blank)}"
         )
 
-    _validate_mailboxes(config, path)
-
+    # Before the mailboxes, since a mailbox without its own batch_size takes
+    # max_messages_per_mailbox.
     for key in ("days_back", "max_messages_per_mailbox"):
         value = config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise SystemProblem(f"Config key '{key}' must be a positive integer.")
+
+    _validate_mailboxes(config, path)
 
     if not isinstance(config["newest_first"], bool):
         raise SystemProblem("Config key 'newest_first' must be true or false.")
@@ -483,11 +489,13 @@ def _validate_mailboxes(config: dict, path: Path) -> None:
     thing confining it, so "not in the loop" is not good enough for juvenile.
 
     Adds `enabled_mailboxes` to the config: the addresses to read, in file
-    order.
+    order. Adds `batch_sizes`: each enabled address's own batch_size, or
+    max_messages_per_mailbox where it has none.
 
     Raises:
         SystemProblem: If the list is empty, an entry is the wrong shape, an
-            address is duplicated, or nothing is enabled.
+            address is duplicated, a batch_size is not a positive integer, or
+            nothing is enabled.
     """
     mailboxes = config["mailboxes"]
     if not isinstance(mailboxes, list) or not mailboxes:
@@ -503,12 +511,13 @@ def _validate_mailboxes(config: dict, path: Path) -> None:
                 "a mapping with 'address' and 'enabled'. See config.example.yaml."
             )
 
-        unknown = sorted(set(entry) - set(MAILBOX_KEYS))
+        unknown = sorted(set(entry) - set(MAILBOX_KEYS) - set(MAILBOX_OPTIONAL_KEYS))
         if unknown:
             raise SystemProblem(
                 f"Config 'mailboxes' entry {index} has unexpected keys: "
-                f"{', '.join(unknown)}. Only 'address' and 'enabled' are read, so a "
-                "typo here would be a setting that silently does nothing."
+                f"{', '.join(unknown)}. Only 'address', 'enabled' and 'batch_size' "
+                "are read, so a typo here would be a setting that silently does "
+                "nothing."
             )
 
         address = entry.get("address")
@@ -535,7 +544,15 @@ def _validate_mailboxes(config: dict, path: Path) -> None:
             )
         seen.add(address)
 
-        normalized.append({"address": address, "enabled": enabled})
+        batch_size = entry.get("batch_size", config["max_messages_per_mailbox"])
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise SystemProblem(
+                f"Config 'mailboxes' entry {index} ({address}) has batch_size "
+                f"{batch_size!r}. It must be a positive integer, or left out to use "
+                "max_messages_per_mailbox."
+            )
+
+        normalized.append({"address": address, "enabled": enabled, "batch_size": batch_size})
 
     enabled_addresses = [entry["address"] for entry in normalized if entry["enabled"]]
     if not enabled_addresses:
@@ -546,6 +563,9 @@ def _validate_mailboxes(config: dict, path: Path) -> None:
 
     config["mailboxes"] = normalized
     config["enabled_mailboxes"] = enabled_addresses
+    config["batch_sizes"] = {
+        entry["address"]: entry["batch_size"] for entry in normalized if entry["enabled"]
+    }
 
 
 def _validate_review_pair(stac: dict) -> None:

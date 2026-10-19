@@ -107,8 +107,8 @@ testing. Changes are tested on dev, pushed, then pulled on live with
 a pass every 180 seconds, starting passes only on weekdays from 07:00 to
 17:30, and sleeping outside those hours. The window must stay open and the
 machine awake, because the browser is a visible window. Each pass takes up
-to `max_messages_per_mailbox` emails from each enabled mailbox, oldest
-first.
+to `max_messages_per_mailbox` emails from each enabled mailbox, or that
+mailbox's own `batch_size` where it has one, oldest first.
 
 **Rechecking waiting emails.** The first pass at or after each time in
 `recheck.times` (live: 09:00, 13:00, 17:00) also searches again for every

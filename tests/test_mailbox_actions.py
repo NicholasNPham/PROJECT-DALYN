@@ -152,6 +152,47 @@ def test_old_and_new_budget_together_are_refused(tmp_path: Path) -> None:
         _load(tmp_path, config)
 
 
+def _two_mailboxes(**second: object) -> dict:
+    """The valid config with a second enabled mailbox, its entry extended by second."""
+    config = copy.deepcopy(VALID_CONFIG)
+    config["mailboxes"].append({"address": "dalyn-test2@example.com", "enabled": True, **second})
+    return config
+
+
+def test_mailbox_without_batch_size_takes_the_global_one(tmp_path: Path) -> None:
+    """Left out, a mailbox's batch is max_messages_per_mailbox."""
+    config = _load(tmp_path, _two_mailboxes())
+
+    assert config["batch_sizes"] == {MAILBOX: 5, "dalyn-test2@example.com": 5}
+
+
+def test_mailbox_batch_size_is_its_own(tmp_path: Path) -> None:
+    """One mailbox's batch_size changes that mailbox only."""
+    config = _load(tmp_path, _two_mailboxes(batch_size=20))
+
+    assert config["batch_sizes"] == {MAILBOX: 5, "dalyn-test2@example.com": 20}
+
+
+def test_disabled_mailbox_has_no_batch_size(tmp_path: Path) -> None:
+    """Only enabled mailboxes are read, so only they get a batch."""
+    config = _load(tmp_path, _two_mailboxes(enabled=False, batch_size=20))
+
+    assert config["batch_sizes"] == {MAILBOX: 5}
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "20", 2.5], ids=["zero", "negative", "bool", "string", "float"])
+def test_bad_batch_size_is_refused(tmp_path: Path, value: object) -> None:
+    """A batch_size that is not a positive integer stops at startup, naming the mailbox."""
+    with pytest.raises(SystemProblem, match="dalyn-test2@example.com.*batch_size"):
+        _load(tmp_path, _two_mailboxes(batch_size=value))
+
+
+def test_misspelled_batch_size_is_refused(tmp_path: Path) -> None:
+    """batchsize would otherwise be a setting that silently does nothing."""
+    with pytest.raises(SystemProblem, match="batchsize"):
+        _load(tmp_path, _two_mailboxes(batchsize=20))
+
+
 def test_non_boolean_switch_is_refused(tmp_path: Path) -> None:
     """"yes" in quotes is a string, and a string is not an answer here."""
     with pytest.raises(SystemProblem, match="tag_enabled"):
