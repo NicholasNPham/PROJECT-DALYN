@@ -69,10 +69,11 @@ MIN_FUZZY_LENGTH = 14
 # Every other rule names a specific document and still matches anywhere, which
 # the office requires: a demand for discovery wins wherever it appears.
 #
-# 25 lines is about double the longest caption seen so far (batch 8's
-# 002_Motion To Consolidate carries six case numbers and puts its title on
-# line 11).
-TITLE_REGION_LINES = 25
+# 35 lines is about one full page. 25 (about double batch 8's
+# 002_Motion To Consolidate, six case numbers with the title on line 11)
+# still missed titles, and a page keeps the window well short of the body
+# text the rule above guards against.
+TITLE_REGION_LINES = 35
 TITLE_ONLY_PHRASES = frozenset({"order", "motion", "judgment", "memorandum of law"})
 
 # Phrases that may sit anywhere in a title line, not only at its start. Kept
