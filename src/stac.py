@@ -45,7 +45,7 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from urllib3.exceptions import HTTPError as Urllib3Error
 from webdriver_manager.chrome import ChromeDriverManager
 
-from exceptions import DocumentProblem, MessageGone, SystemProblem
+from exceptions import DocumentProblem, MessageGone, ServiceUnreachable, SystemProblem
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -600,9 +600,11 @@ class StacSession:
         """Launch Chrome, load STAC, and sign in.
 
         Raises:
-            SystemProblem: If Chrome will not start, STAC will not load, or
-                the credentials are refused. None of these are a problem with
-                any one document, so the pass should stop.
+            ServiceUnreachable: If STAC's login page does not load in time.
+            SystemProblem: If Chrome will not start, STAC will not load for
+                any other reason, or the credentials are refused. None of
+                these are a problem with any one document, so the pass should
+                stop.
         """
         logger.info(
             "Opening STAC at %s (test instance: %s, uploading: %s, saving: %s)",
@@ -622,7 +624,11 @@ class StacSession:
             self.driver.maximize_window()
         except BROWSER_ERRORS as error:
             self.close()
-            raise SystemProblem(
+            # Only a page load that ran out of time is STAC or the network
+            # not answering. Chrome crashing or refusing the page is not
+            # fixed by waiting, so it stays a SystemProblem.
+            problem = ServiceUnreachable if isinstance(error, TimeoutException) else SystemProblem
+            raise problem(
                 f"Could not load STAC at {self.url}: {type(error).__name__}"
             ) from error
 

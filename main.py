@@ -39,7 +39,7 @@ from alert import report_failure, report_success  # noqa: E402
 import ocr  # noqa: E402
 import ucn  # noqa: E402
 from config_loader import load_config  # noqa: E402
-from exceptions import DocumentProblem, GraphAuthError, MessageGone, SystemProblem  # noqa: E402
+from exceptions import DocumentProblem, GraphAuthError, MessageGone, ServiceUnreachable, SystemProblem  # noqa: E402
 from graph_client import GraphClient  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from models import EmailDecision, Outcome, ReviewTag, StacResult  # noqa: E402
@@ -1126,9 +1126,15 @@ def _watch(config: dict, limit: int | None, interval: int, hours: WorkingHours |
     sheet is reloaded each pass, so a sheet edit shows up on the next pass
     without restarting.
 
-    A failed credential stops the watch at once. Any other SystemProblem is
-    logged and retried next pass, up to MAX_CONSECUTIVE_FAILURES in a row.
-    The alert email follows each pass the same way it follows a single run.
+    A failed credential stops the watch at once. ServiceUnreachable, STAC
+    or Microsoft not answering, is retried every pass for as long as it
+    lasts and never counts toward the stop: waiting is the fix, and on 20
+    Oct 2026 a network outage stopped the watch until it was restarted by
+    hand the next morning.
+    Any other SystemProblem is logged and retried next pass, up to
+    MAX_CONSECUTIVE_FAILURES in a row. The alert email follows each pass the
+    same way it follows a single run, so an outage sends one "stopped" and
+    one "running again".
 
     Waiting for STAC emails are searched again on the first pass, since a
     restart may have missed a recheck time, and then on the first pass at
@@ -1162,6 +1168,14 @@ def _watch(config: dict, limit: int | None, interval: int, hours: WorkingHours |
                 report_success(config)
             except GraphAuthError:
                 raise
+            except ServiceUnreachable as error:
+                # Leaves the count where it was, neither adding nor clearing:
+                # an outage between two real failures does not hide them.
+                logger.error(
+                    "Pass %s could not reach a service, trying again next pass (not counted toward the stop): %s",
+                    pass_number, error,
+                )
+                report_failure(config, error)
             except SystemProblem as error:
                 failures += 1
                 logger.error("Pass %s failed (%s in a row): %s", pass_number, failures, error)

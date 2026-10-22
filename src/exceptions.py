@@ -26,5 +26,15 @@ class GraphAuthError(SystemProblem):
     """DALYN could not get an access token from Microsoft."""
 
 
+class ServiceUnreachable(SystemProblem):
+    """STAC or Microsoft did not answer. Nothing is wrong with DALYN; wait and try again.
+
+    --watch keeps retrying these instead of counting them toward the stop.
+    On 20 Oct 2026 the STAC login page timed out three passes running,
+    with Graph timing out alongside, and the watch stopped over what was a
+    network outage until it was restarted by hand the next morning.
+    """
+
+
 class MessageGone(DalynError):
     """The email was moved, deleted or purged after it was listed. Log it and skip it."""

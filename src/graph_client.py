@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import msal
 import requests
 
-from exceptions import GraphAuthError, MessageGone, SystemProblem
+from exceptions import GraphAuthError, MessageGone, ServiceUnreachable, SystemProblem
 from logger import get_logger
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -116,9 +116,10 @@ class GraphClient:
 
         Raises:
             GraphAuthError: If Microsoft refuses to issue a token.
-            SystemProblem: If Microsoft cannot be reached for a new token
-                after TOKEN_RETRIES tries. The pass fails and --watch tries
-                again, rather than stopping as it would on a refused credential.
+            ServiceUnreachable: If Microsoft cannot be reached for a new
+                token after TOKEN_RETRIES tries. The pass fails and --watch
+                keeps trying, rather than stopping as it would on a refused
+                credential.
         """
         for attempt in range(TOKEN_RETRIES):
             try:
@@ -131,7 +132,7 @@ class GraphClient:
                 # --watch: the gap 5c36f37 left. Asking for a token changes
                 # nothing, so it is always safe to ask again.
                 if attempt == TOKEN_RETRIES - 1:
-                    raise SystemProblem(
+                    raise ServiceUnreachable(
                         f"Could not reach Microsoft for a Graph token ({type(error).__name__}) "
                         f"after {TOKEN_RETRIES} tries."
                     ) from error
@@ -212,9 +213,12 @@ class GraphClient:
         Raises:
             GraphAuthError: On 401, meaning the credential is bad or revoked.
             MessageGone: On 404, only when gone_on_404 is set.
-            SystemProblem: On any other non-success status, if retries run
-                out, or if a write loses its connection. A read that loses its
-                connection is retried like a 503.
+            ServiceUnreachable: If retries run out. Every retried case is
+                Microsoft not answering with nothing done, so --watch keeps
+                trying.
+            SystemProblem: On any other non-success status, or if a write
+                loses its connection. A read that loses its connection is
+                retried like a 503.
         """
         extra_headers = dict(kwargs.pop("headers", {}))
         # Every call, so an ID read in one call is valid in the next. Graph
@@ -293,7 +297,7 @@ class GraphClient:
                 f"{response.text[:200]}"
             )
 
-        raise SystemProblem(
+        raise ServiceUnreachable(
             f"Graph {method} still failing after {MAX_RETRIES} attempts"
         )
 

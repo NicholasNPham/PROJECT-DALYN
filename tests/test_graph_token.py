@@ -7,7 +7,7 @@ import pytest
 import requests
 
 import graph_client
-from exceptions import GraphAuthError, SystemProblem
+from exceptions import GraphAuthError, ServiceUnreachable, SystemProblem
 from graph_client import TOKEN_RETRIES, GraphClient
 
 
@@ -44,14 +44,15 @@ def test_dropped_renewal_is_tried_again(monkeypatch: pytest.MonkeyPatch) -> None
     assert msal_app.calls == 2
 
 
-def test_renewal_that_never_connects_is_a_system_problem(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Out of tries: a SystemProblem, which --watch survives, not a raw error."""
+def test_renewal_that_never_connects_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Out of tries: ServiceUnreachable, which --watch keeps retrying, not a raw error or an auth error."""
     msal_app = FakeMsal(drops=TOKEN_RETRIES, answer={"access_token": "placeholder"})
 
-    with pytest.raises(SystemProblem, match="ConnectionError") as raised:
+    with pytest.raises(ServiceUnreachable, match="ConnectionError") as raised:
         _client(monkeypatch, msal_app)._get_token()
 
-    assert type(raised.value) is SystemProblem
+    assert isinstance(raised.value, SystemProblem)
+    assert not isinstance(raised.value, GraphAuthError)
     assert msal_app.calls == TOKEN_RETRIES
 
 
@@ -63,3 +64,73 @@ def test_refused_credential_is_still_an_auth_error(monkeypatch: pytest.MonkeyPat
         _client(monkeypatch, msal_app)._get_token()
 
     assert msal_app.calls == 1
+
+
+class FakeResponse:
+    """A Graph answer with only a status code."""
+
+    def __init__(self, status_code: int) -> None:
+        """Hold the status, with no Retry-After header."""
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.headers: dict[str, str] = {}
+        self.text = ""
+
+
+class FakeSession:
+    """Stands in for requests.Session: every call drops, or every call gets `status`."""
+
+    def __init__(self, status: int | None) -> None:
+        """None means the connection drops every time."""
+        self.status = status
+        self.calls = 0
+
+    def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
+        """Drop the line the way requests does, or answer with the status."""
+        self.calls += 1
+        if self.status is None:
+            raise requests.ReadTimeout("read timed out")
+        return FakeResponse(self.status)
+
+
+def _request_client(monkeypatch: pytest.MonkeyPatch, status: int | None) -> GraphClient:
+    """A client whose token always works and whose Graph calls all fail the same way."""
+    client = _client(monkeypatch, FakeMsal(drops=0, answer={"access_token": "placeholder"}))
+    client._session = FakeSession(status)
+    return client
+
+
+@pytest.mark.parametrize("status", [None, 503, 504])
+def test_read_out_of_retries_is_unreachable(monkeypatch: pytest.MonkeyPatch, status: int | None) -> None:
+    """The 20 Oct 5:18 PM ReadTimeout, but every try: --watch waits it out instead of stopping."""
+    client = _request_client(monkeypatch, status)
+
+    with pytest.raises(ServiceUnreachable, match="still failing after"):
+        client._request("GET", "https://graph.example.invalid/x")
+
+    assert client._session.calls == graph_client.MAX_RETRIES
+
+
+def test_busy_write_out_of_retries_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 503 means Microsoft did nothing, so even a write is safe to call unreachable."""
+    with pytest.raises(ServiceUnreachable):
+        _request_client(monkeypatch, 503)._request("PATCH", "https://graph.example.invalid/x")
+
+
+def test_write_that_drops_is_still_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A write may have landed before the line dropped, so it stays a plain SystemProblem."""
+    client = _request_client(monkeypatch, None)
+
+    with pytest.raises(SystemProblem, match="may or may not have gone through") as raised:
+        client._request("PATCH", "https://graph.example.invalid/x")
+
+    assert type(raised.value) is SystemProblem
+    assert client._session.calls == 1
+
+
+def test_gateway_error_on_a_write_is_still_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 502 PATCH from 19 and 21 Oct: not retried, not unreachable."""
+    with pytest.raises(SystemProblem, match="failed with 502") as raised:
+        _request_client(monkeypatch, 502)._request("PATCH", "https://graph.example.invalid/x")
+
+    assert type(raised.value) is SystemProblem

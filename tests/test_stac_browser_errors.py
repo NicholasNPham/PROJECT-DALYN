@@ -8,10 +8,10 @@ same error from fakes.
 from pathlib import Path
 
 import pytest
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from urllib3.exceptions import ReadTimeoutError
 
-from exceptions import SystemProblem
+from exceptions import ServiceUnreachable, SystemProblem
 from stac import PartiallyEntered, StacRunner, StacSession
 
 
@@ -124,6 +124,49 @@ def test_sign_in_page_that_hangs_is_a_system_problem() -> None:
 
     assert driver.quit_called
     assert session.driver is None
+
+
+class RefusingDriver:
+    """A driver whose page load fails with a chosen Selenium error."""
+
+    def __init__(self, error: Exception) -> None:
+        """Hold the error the load raises."""
+        self.error = error
+
+    def get(self, url: str) -> None:
+        """The load fails."""
+        raise self.error
+
+    def quit(self) -> None:
+        """Closes cleanly."""
+
+
+def _opening_session(driver: RefusingDriver) -> StacSession:
+    """A session that will try to open STAC with `driver`."""
+    session = StacSession.__new__(StacSession)
+    session.url = "https://stac.example.invalid"
+    session.is_test_instance = True
+    session.upload_enabled = False
+    session.save_enabled = False
+    session.wait_timeout = 1
+    session.driver = None
+    session.wait = None
+    session._start_chrome = lambda: driver
+    return session
+
+
+def test_login_page_that_times_out_is_unreachable() -> None:
+    """The 20 Oct outage: STAC not answering is waited out, not counted toward the stop."""
+    with pytest.raises(ServiceUnreachable, match="Could not load STAC.*TimeoutException"):
+        _opening_session(RefusingDriver(TimeoutException("page load"))).open()
+
+
+def test_login_page_chrome_refuses_is_still_counted() -> None:
+    """Chrome failing the load some other way is not fixed by waiting."""
+    with pytest.raises(SystemProblem, match="WebDriverException") as raised:
+        _opening_session(RefusingDriver(WebDriverException("chrome not reachable"))).open()
+
+    assert type(raised.value) is SystemProblem
 
 
 class CountingSession:
