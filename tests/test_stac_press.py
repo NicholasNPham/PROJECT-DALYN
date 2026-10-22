@@ -7,7 +7,7 @@ way Chrome does while STAC's loading spinner covers it.
 import logging
 
 import pytest
-from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
+from selenium.common.exceptions import ElementClickInterceptedException, NoSuchElementException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from urllib3.exceptions import ReadTimeoutError
 
@@ -323,3 +323,96 @@ def test_browser_error_message_names_no_page_text() -> None:
 
     assert "WebDriverException" in str(raised.value)
     assert "chrome not reachable" not in str(raised.value)
+
+
+class UnconfirmedDriver(FakeDriver):
+    """Save clicks fine, but the success box never shows.
+
+    The shape of the 12 unconfirmed saves from 19 to 21 Oct 2026. Counts
+    `tiles` image tiles, and answers the page script with `page`, or raises
+    from it when `page` is None.
+    """
+
+    def __init__(self, tiles: int, page: dict | None) -> None:
+        """Hold the tile count and what the page script reports."""
+        super().__init__(FakeButton(covered=0), subtype="ORDERS")
+        self.tiles = tiles
+        self.page = page
+
+    def find_element(self, by: str, value: str) -> FakeButton:
+        """The Save button by id. The success box by xpath is never there."""
+        if by == "xpath":
+            raise NoSuchElementException("no success box")
+        return self.button
+
+    def find_elements(self, by: str, value: str) -> list[object]:
+        """The image tiles on the case."""
+        return [object()] * self.tiles
+
+    def execute_script(self, script: str, *args: str) -> object:
+        """The Kendo subtype read, or the page description."""
+        if script is not stac.DESCRIBE_SAVE_PAGE_JS:
+            return self.subtype
+        if self.page is None:
+            raise WebDriverException("javascript error")
+        return self.page
+
+
+def _unconfirmed_session(tiles: int = 0, page: dict | None = None) -> StacSession:
+    """A session whose Save is pressed and never confirmed."""
+    session = StacSession.__new__(StacSession)
+    session.driver = UnconfirmedDriver(tiles, page)
+    session.upload_timeout = 0.1
+    return session
+
+
+def test_unconfirmed_save_logs_the_page(caplog: pytest.LogCaptureFixture) -> None:
+    """The warning names the notifications, spinners, Save state and tile counts."""
+    session = _unconfirmed_session(tiles=0)
+    page = {"notifications": ["c-notification.c-notification-error"], "spinners": 1, "save": "disabled", "tiles": 1}
+
+    def describe(script: str, *args: str) -> object:
+        """A tile shows up after the click, as a late save would leave it."""
+        return page if script is stac.DESCRIBE_SAVE_PAGE_JS else "ORDERS"
+
+    session.driver.execute_script = describe
+
+    with caplog.at_level(logging.WARNING, logger="dalyn.stac"), pytest.raises(SaveMayHaveHappened, match="STAC never confirmed"):
+        session._save("UCN", "ORDERS", "document.pdf")
+
+    assert "UCN: no confirmation after Save" in caplog.text
+    assert "c-notification-error" in caplog.text
+    assert "spinners 1, Save disabled, image tiles 0 before and 1 now" in caplog.text
+
+
+def test_unconfirmed_save_with_no_notifications_says_none(caplog: pytest.LogCaptureFixture) -> None:
+    """An empty list reads as none, so the line is easy to scan."""
+    page = {"notifications": [], "spinners": 0, "save": "enabled", "tiles": 2}
+
+    with caplog.at_level(logging.WARNING, logger="dalyn.stac"), pytest.raises(SaveMayHaveHappened):
+        _unconfirmed_session(tiles=2, page=page)._save("UCN", "ORDERS", "document.pdf")
+
+    assert "Notifications none, spinners 0, Save enabled, image tiles 2 before and 2 now" in caplog.text
+
+
+def test_unreadable_page_still_raises_the_unconfirmed_save(caplog: pytest.LogCaptureFixture) -> None:
+    """The page script failing is logged by type and never replaces the real error."""
+    with caplog.at_level(logging.WARNING, logger="dalyn.stac"), pytest.raises(SaveMayHaveHappened, match="STAC never confirmed"):
+        _unconfirmed_session(page=None)._save("UCN", "ORDERS", "document.pdf")
+
+    assert "could not read the page after the unconfirmed save (WebDriverException)" in caplog.text
+    assert "javascript error" not in caplog.text
+
+
+def test_browser_crash_while_confirming_does_not_describe_the_page(caplog: pytest.LogCaptureFixture) -> None:
+    """Only a timeout gets the page line. A dead Chrome has no page to read."""
+    with caplog.at_level(logging.WARNING, logger="dalyn.stac"), pytest.raises(SaveMayHaveHappened):
+        _crashing_session("confirm")._save("UCN", "ORDERS", "document.pdf")
+
+    assert "no confirmation after Save" not in caplog.text
+    assert "could not read the page" not in caplog.text
+
+
+def test_tile_count_is_none_when_the_page_will_not_say() -> None:
+    """A driver that cannot count gives None, not an error that would stop the save."""
+    assert _crashing_session("confirm")._count_image_tiles() is None

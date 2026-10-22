@@ -429,6 +429,34 @@ SPINNER_OUTSIDE_PREVIEW_CSS = f"{SPINNER_CSS}:not({PREVIEW_PANE_CSS} {SPINNER_CS
 SAVE_BUTTON_ID = "SaveImage"
 SAVED_NOTIFICATION_XPATH = "//div[contains(@class,'c-notification-success')]"
 
+# Every image tile on the case, selected or not, counted before Save and
+# again when the confirmation never comes.
+IMAGE_TILE_CSS = "#image-manager-listview-name .cipimage"
+
+# What the page shows when Save got no confirmation. Between 19 and 21 Oct
+# 2026, 12 saves waited the full timeout for the success box and the refresh
+# afterwards wiped whatever STAC was showing. Markup only, never page text:
+# an error notification can quote the case caption.
+DESCRIBE_SAVE_PAGE_JS = """
+var saveId = arguments[0], spinnerCss = arguments[1], tileCss = arguments[2];
+function shown(e) { return e.getClientRects().length > 0; }
+var notes = Array.from(document.querySelectorAll("div[class*='c-notification']"))
+  .filter(shown)
+  .map(function (e) {
+    return Array.from(e.classList).filter(function (c) { return c.indexOf('c-notification') === 0; }).join('.');
+  });
+var save = document.getElementById(saveId);
+var saveState = !save ? 'missing'
+  : (save.disabled || save.classList.contains('k-disabled')) ? 'disabled'
+  : shown(save) ? 'enabled' : 'hidden';
+return {
+  notifications: notes,
+  spinners: Array.from(document.querySelectorAll(spinnerCss)).filter(shown).length,
+  save: saveState,
+  tiles: document.querySelectorAll(tileCss).length
+};
+"""
+
 # Words STAC hangs off a defendant name that are not part of the name: alert
 # flags, programme codes, prosecutor initials. Carried over from PCSO911.
 EXCLUDED_NAME_TOKENS = frozenset({
@@ -1840,6 +1868,8 @@ class StacSession:
                 f"The browser failed while checking the Subtype before Save: {type(error).__name__}"
             ) from error
 
+        tiles_before = self._count_image_tiles()
+
         # A covered click never reaches the button, so nothing is saved and
         # trying again is safe.
         press = PressWhenUncovered(SAVE_BUTTON_ID)
@@ -1870,6 +1900,8 @@ class StacSession:
             reason = "STAC never confirmed" if isinstance(error, TimeoutException) else (
                 f"the browser failed before STAC confirmed ({type(error).__name__})"
             )
+            if isinstance(error, TimeoutException):
+                self._log_unconfirmed_page(ucn, tiles_before)
             raise SaveMayHaveHappened(
                 f"Pressed Save for {names} on {ucn} but {reason}. "
                 "The document may or may not be on the case. Check it by hand; "
@@ -1892,6 +1924,35 @@ class StacSession:
             )
 
         logger.info("%s: saved %s under %s", ucn, names, self._pair)
+
+    def _count_image_tiles(self) -> int | None:
+        """Count the image tiles on the case, or None if the page will not say.
+
+        Only feeds the log when a save goes unconfirmed, so it never raises.
+        """
+        try:
+            return len(self.driver.find_elements(By.CSS_SELECTOR, IMAGE_TILE_CSS))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _log_unconfirmed_page(self, ucn: str, tiles_before: int | None) -> None:
+        """Log what the page shows after Save went unconfirmed, before the refresh.
+
+        Never raises: the unconfirmed save is the error worth reporting, and
+        this line is only evidence for it.
+        """
+        try:
+            page = self.driver.execute_script(
+                DESCRIBE_SAVE_PAGE_JS, SAVE_BUTTON_ID, SPINNER_OUTSIDE_PREVIEW_CSS, IMAGE_TILE_CSS
+            )
+            logger.warning(
+                "%s: no confirmation after Save. Notifications %s, spinners %s, Save %s, "
+                "image tiles %s before and %s now",
+                ucn, page.get("notifications") or "none", page.get("spinners"), page.get("save"),
+                tiles_before, page.get("tiles"),
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning("%s: could not read the page after the unconfirmed save (%s)", ucn, type(error).__name__)
 
 
 def defendant_from_caption(document_text: str) -> str | None:
