@@ -14,6 +14,10 @@ Three phrases are exceptions: ORDER, MOTION and JUDGMENT exist to catch titles
 they cannot name, so they only look at the first TITLE_REGION_LINES lines,
 where a title can actually be. Everywhere else they do more harm than good.
 
+A title that wraps onto a second line gets one more try when nothing else
+matched: each pair of neighbouring title-region lines is joined and matched
+again, so MOTION TO WITHDRAW AS / COUNSEL finds its row.
+
 The bottom row of the sheet is the safety net. It is tried only after every
 other rule has had its turn, exact and fuzzy both, so a catch-all phrase like
 CERTIFICATE OF SERVICE can never outrank a real title.
@@ -323,11 +327,14 @@ def load_rules(excel_path: Path) -> list[Rule]:
 def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
     """Return the Type and Subtype for one document, or an empty result.
 
-    Three passes, in this order:
+    Four passes, in this order:
 
         1. Exact, over every rule that files to a real Type.
         2. Fuzzy, over those same rules where Fuzzy? is YES.
-        3. The safety-net rules, exact then fuzzy.
+        3. Both again, over title-region lines joined in neighbouring pairs,
+           for a title that wraps onto a second line. Only reached when 1 and
+           2 found nothing, so a document that matches today never changes.
+        4. The safety-net rules, exact then fuzzy.
 
     A safety net is any rule with a blank TYPE and SUBTYPE. It is held back
     because a net that competes in pass one is not a net: a phrase that appears
@@ -358,6 +365,17 @@ def classify(rules: list[Rule], document_text: str) -> ClassificationResult:
         contenders, lines, title_lines
     )
     if result is not None:
+        return result
+
+    # Wrapped titles went to PLS RVW although the sheet had their row. Joined
+    # lines are passed as both line lists, so every kind of rule sees them and
+    # nothing outside the title region is ever glued together.
+    joined = _joined_title_lines(title_lines)
+    result = _match_exact(contenders, joined, joined) or _match_fuzzy(contenders, joined, joined)
+    if result is not None:
+        # The phrase is the sheet's. The joined line is title text that can
+        # carry a name, so it stays out of the log.
+        logger.info("Matched rules row %s (%r) across two title lines", result.rule_row, result.matched_phrase)
         return result
 
     if safety_nets:
@@ -392,6 +410,15 @@ def _match_exact(
             if rule.name_gap and rule.name_gap.match(line):
                 return _result(rule, line, 1.0)
     return None
+
+
+def _joined_title_lines(title_lines: list[str]) -> list[str]:
+    """Each title-region line joined with the one after it.
+
+    A phrase that fits on either line alone has already had its chance, so a
+    match here is one that crosses the break.
+    """
+    return [f"{first} {second}" for first, second in zip(title_lines, title_lines[1:])]
 
 
 def _contains_as_title(phrase: str, line: str) -> bool:

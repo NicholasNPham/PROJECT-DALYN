@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -255,6 +256,83 @@ def test_safety_net_only_wins_when_nothing_else_matches() -> None:
 
     assert classify(rules, "demandfordiscqvery\nCertificate of Service").rule_row == 3
     assert classify(rules, "Certificate of Service").rule_row == 2
+
+
+def test_title_split_over_two_lines_matches() -> None:
+    """A wrapped title used to go to PLS RVW although the sheet had its row."""
+    rules = [_rule("MOTION TO WITHDRAW AS COUNSEL", "COURT", "MOTIONS", 2)]
+
+    assert classify(rules, "STATE OF FLORIDA\nMOTION TO WITHDRAW AS\nCOUNSEL\nbody").rule_row == 2
+
+
+def test_name_gap_title_split_by_a_long_name_matches() -> None:
+    """A long name is what usually pushes a defense title onto a second line."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    assert classify(rules, "STATE OF FLORIDA\nDEFENDANT JOHN\nDOE'S WITNESS LIST").rule_row == 2
+
+
+def test_leading_star_title_split_over_two_lines_matches(tmp_path: Path) -> None:
+    """A firm's name, then the phrase broken across the line end."""
+    rules = _sheet_rules(tmp_path, ("* MOTION TO WITHDRAW", "COURT", "MOTIONS"))
+
+    assert classify(rules, "STATE OF FLORIDA\nTHE DOE LAW FIRM S MOTION TO\nWITHDRAW AS COUNSEL").rule_row == 2
+
+
+def test_fuzzy_title_split_over_two_lines_matches() -> None:
+    """A wrapped title that OCR also mangled."""
+    rules = [_rule("DEMAND FOR DISCOVERY", "DISCOVERY", "DEMAND", 2, fuzzy=True)]
+    result = classify(rules, "STATE OF FLORIDA\nDEMAND FOR\nDISCQVERY")
+
+    assert result.rule_row == 2
+    assert result.is_fuzzy
+
+
+def test_joined_lines_never_change_a_single_line_match() -> None:
+    """Joining is a last try: a lower row matching one line still wins over a higher row's join."""
+    rules = [
+        _rule("MOTION TO WITHDRAW AS COUNSEL", "COURT", "COUNSEL", 2),
+        _rule("MOTION TO WITHDRAW", "COURT", "MOTIONS", 3),
+    ]
+
+    assert classify(rules, "STATE OF FLORIDA\nMOTION TO WITHDRAW AS\nCOUNSEL").rule_row == 3
+
+
+def test_joined_lines_stay_in_the_title_region() -> None:
+    """A title split past the title region is body text and is not joined."""
+    rules = [_rule("MOTION TO WITHDRAW AS COUNSEL", "COURT", "MOTIONS", 2)]
+    body = "\n".join(["filler line"] * (TITLE_REGION_LINES + 5) + ["MOTION TO WITHDRAW AS", "COUNSEL"])
+
+    assert classify(rules, body) == ClassificationResult()
+
+
+def test_title_over_three_lines_is_not_joined() -> None:
+    """Two lines at most, so a caption and a title are less likely to be glued together."""
+    rules = [_rule("MOTION TO WITHDRAW AS COUNSEL", "COURT", "MOTIONS", 2)]
+
+    assert classify(rules, "STATE OF FLORIDA\nMOTION TO\nWITHDRAW AS\nCOUNSEL") == ClassificationResult()
+
+
+def test_safety_net_still_comes_after_a_joined_title() -> None:
+    """A catch-all row loses to a real row found across two lines."""
+    rules = [
+        _rule("CERTIFICATE OF SERVICE", None, None, 2),
+        _rule("MOTION TO WITHDRAW AS COUNSEL", "COURT", "MOTIONS", 3),
+    ]
+
+    assert classify(rules, "MOTION TO WITHDRAW AS\nCOUNSEL\nCertificate of Service").rule_row == 3
+
+
+def test_joined_match_logs_the_row_not_the_title(caplog: pytest.LogCaptureFixture) -> None:
+    """The title can carry a defendant's name, so only the sheet's phrase is logged."""
+    rules = [_gap_rule("DEFENDANT * WITNESS LIST")]
+
+    with caplog.at_level(logging.INFO, logger="dalyn.classifier"):
+        classify(rules, "STATE OF FLORIDA\nDEFENDANT JOHN\nDOE'S WITNESS LIST")
+
+    assert "across two title lines" in caplog.text
+    assert "DEFENDANT * WITNESS LIST" in caplog.text
+    assert "john" not in caplog.text.lower()
 
 
 def test_no_match_and_empty_text_return_empty_result() -> None:
