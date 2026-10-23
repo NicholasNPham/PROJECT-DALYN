@@ -481,12 +481,12 @@ def _match_fuzzy(
         return None
 
     rule, line, similarity = best
+    # The line itself stays out: a title can carry a defendant's name.
     logger.info(
-        "Fuzzy match at %.0f%%: rules row %s (%r) matched %r",
+        "Fuzzy match at %.0f%%: rules row %s (%r)",
         similarity * 100,
         rule.row,
         rule.phrase,
-        line,
     )
     return _result(rule, line, similarity)
 
