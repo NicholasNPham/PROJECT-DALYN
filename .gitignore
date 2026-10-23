@@ -55,6 +55,14 @@ ENV/
 *.docx
 ~$*
 
+# ------------------------------------------------------- local-only scripts
+# check_caption.py and try_eml.py exist to look at real defendant names.
+# make_docs.py builds the internal V1 write-up, which describes the office's
+# permissions and live setup and is not for a public repository.
+check_caption.py
+try_eml.py
+make_docs.py
+
 # ----------------------------------------------------------------- editors
 .idea/
 .vscode/
