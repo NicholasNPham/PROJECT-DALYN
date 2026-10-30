@@ -54,6 +54,12 @@ HIGHLANDS_HARDEE_PATTERN = re.compile(
 # nothing is converted or guessed. An old case STAC does not have still
 # goes straight to a person under the year rule.
 OLD_POLK_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}[A-Z]{2}\d{8}[A-Z]{4})")
+# Polk juvenile numbers end in six zeros instead of a party and division:
+# 53 2024 CJ 000000 000000. Three valid ones from 2024 and 2025 were not
+# read (Nick, 30 Oct 2026). Only CJ with an all-zero ending is accepted,
+# since a run of digits after dashes and spaces are stripped could be a
+# date or page number joined onto a shorter case number.
+POLK_JUVENILE_PATTERN = re.compile(r"(?<!\d)(?!25|28)(\d{6}CJ\d{6}0{6})(?!\d)")
 TRAFFIC_COURTS = frozenset({"CT", "TT"})
 # Courts whose second position is a different code from the first.
 SECOND_COURT = {"CJ": "JL"}
@@ -152,6 +158,7 @@ def _find_all(text: str) -> list[str]:
     """
     stripped = re.sub(r"[\s-]+", "", text).upper()
     found = [(m.start(), m.group(1)) for m in UCN_PATTERN.finditer(stripped)]
+    found += [(m.start(), m.group(1)) for m in POLK_JUVENILE_PATTERN.finditer(stripped)]
     for m in HIGHLANDS_HARDEE_PATTERN.finditer(stripped):
         if _courts_agree(m.group(2), m.group(3)):
             found.append((m.start(), m.group(1)))

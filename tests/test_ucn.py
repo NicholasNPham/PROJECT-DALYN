@@ -310,3 +310,44 @@ def test_old_polk_form_not_tried_when_a_current_form_is_there():
 def test_old_polk_shape_with_a_highlands_or_hardee_county_is_not_read():
     assert ucn.find_all("282009CF00000001XXXX") == []
     assert ucn.find_all("252009CF00000001XXXX") == []
+
+
+POLK_JUVENILE = "532026CJ000000000000"
+
+
+def test_polk_juvenile_form_matches():
+    assert ucn.find_all(POLK_JUVENILE) == [POLK_JUVENILE]
+
+
+def test_polk_juvenile_dashed_form_matches():
+    assert ucn.find_all("Case 53-2026-CJ-000000-0000-00 filed") == [POLK_JUVENILE]
+
+
+def test_polk_juvenile_form_found_in_the_subject():
+    assert ucn.find_ucn("", subject=f"RE: {POLK_JUVENILE} Notice") == POLK_JUVENILE
+
+
+def test_polk_juvenile_form_read_alongside_a_current_form_in_order():
+    text = f"532026CF000000A000XX and {POLK_JUVENILE}"
+    assert ucn.find_all(text) == ["532026CF000000A000XX", POLK_JUVENILE]
+
+
+def test_polk_juvenile_email_agrees_with_document():
+    assert _choose(subject=POLK_JUVENILE, document=f"Case No. {POLK_JUVENILE}") == (
+        (POLK_JUVENILE, "subject"),
+        "",
+    )
+
+
+def test_polk_digit_ending_needs_cj_and_all_zeros():
+    assert ucn.find_all("532026CF000000000000") == []
+    assert ucn.find_all("532026CJ000000000001") == []
+
+
+def test_polk_juvenile_form_with_an_extra_digit_is_not_read():
+    assert ucn.find_all("532026CJ0000000000001") == []
+
+
+def test_polk_juvenile_shape_with_a_highlands_or_hardee_county_is_not_read():
+    assert ucn.find_all("282026CJ000000000000") == []
+    assert ucn.find_all("252026CJ000000000000") == []
