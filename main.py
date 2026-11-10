@@ -626,6 +626,65 @@ def _decide_email(rows: list[dict], email_number: int, keep_decision: bool = Fal
     return f"Email {email_number}: {label} -> {decision}. {reason}"
 
 
+# Windows caps a path at 260 characters, terminator included, unless long
+# paths are switched on in the registry. Past that, opening the file fails
+# with "No such file or directory". A clerk once put a whole ruling in an
+# order's filename and the temp path reached 270, stopping the watch.
+MAX_UPLOAD_PATH = 259
+# Room left on top of the cap, so a slightly deeper install folder on another
+# machine does not land right on the edge.
+UPLOAD_PATH_MARGIN = 9
+# Below this many characters of the original name, the cut name no longer
+# says what the document is, so the folder is too deep to work from.
+MIN_UPLOAD_STEM = 20
+WINDOWS_BAD_CHARACTERS = frozenset('<>:"/\\|?*')
+
+
+def _upload_name(name: str, prefix: str, work_dir: Path) -> str:
+    """Make an attachment name safe to write under work_dir on Windows.
+
+    Swaps characters Windows refuses in a filename for underscores, drops the
+    trailing dots and spaces Windows silently strips, and cuts the part before
+    the extension so the full path stays under the 260 character limit. The
+    cut is sized from work_dir's real length, so a deeper install folder gets
+    a shorter name instead of a crash.
+
+    Args:
+        name: the attachment's filename as the sender sent it.
+        prefix: the email and position prefix, kept whole so names stay unique.
+        work_dir: the folder the file will be written to.
+
+    Returns:
+        The filename to use, prefix included.
+
+    Raises:
+        SystemProblem: work_dir is so deep that not even a short name fits.
+    """
+    cleaned = "".join(
+        "_" if character in WINDOWS_BAD_CHARACTERS or ord(character) < 32 else character
+        for character in name.strip()
+    )
+    suffix = Path(cleaned).suffix
+    # A long "suffix" is a dot inside the title, not an extension. Keep it in
+    # the stem so it gets trimmed with the rest.
+    if len(suffix) > 10:
+        suffix = ""
+    stem = cleaned[: len(cleaned) - len(suffix)] if suffix else cleaned
+
+    # +1 for the separator between work_dir and the filename.
+    budget = MAX_UPLOAD_PATH - UPLOAD_PATH_MARGIN - len(str(work_dir.resolve())) - 1
+    room = budget - len(prefix) - len(suffix)
+    if room < MIN_UPLOAD_STEM:
+        raise SystemProblem(
+            f"The temp folder path is {len(str(work_dir.resolve()))} characters, "
+            "too deep to write attachments under Windows' path limit. "
+            "Move the project to a shorter folder or enable long paths."
+        )
+
+    stem = stem[:room].rstrip(". ") or "attachment"
+    return f"{prefix}{stem}{suffix}"
+
+
 def _stac_documents(rows: list[dict], work_dir: Path, email_number: int) -> list:
     """Write this email's enterable attachments to disk for Selenium.
 
@@ -642,7 +701,9 @@ def _stac_documents(rows: list[dict], work_dir: Path, email_number: int) -> list
     for position, row in enumerate(rows, start=1):
         if row["outcome"] not in ENTERABLE:
             continue
-        target = work_dir / f"{email_number:04d}_{position}_{row['attachment_name'].strip()}"
+        target = work_dir / _upload_name(
+            row["attachment_name"], f"{email_number:04d}_{position}_", work_dir
+        )
         target.write_bytes(row["_bytes"])
         documents.append((target, row["classified_type"], row["classified_subtype"]))
 
